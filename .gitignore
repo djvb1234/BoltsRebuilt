@@ -1,0 +1,31 @@
+# Publication allowlist: explicitly admit reviewed files as they are published.
+# This workspace also contains game images, archives, and nested source trees.
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+
+# Keep secrets and local artifacts excluded inside future admitted directories.
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+*.iso
+*.xex
+*.xpr
+*.zip
+*.rar
+*.7z
+*.exe
+*.dll
+*.pdb
+*.dmp
+*.log
+__pycache__/
+*.pyc
+.vs/
+.vscode/
+build/
+out/
