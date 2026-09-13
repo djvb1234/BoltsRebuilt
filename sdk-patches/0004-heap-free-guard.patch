@@ -1,0 +1,129 @@
+diff --git a/src/kernel/crt/heap.cpp b/src/kernel/crt/heap.cpp
+index 1bebea9..5f2230a 100644
+--- a/src/kernel/crt/heap.cpp
++++ b/src/kernel/crt/heap.cpp
+@@ -11,8 +11,12 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <atomic>
++
+ #include <o1heap.h>
+ 
++#include <rex/system/thread_state.h>
++
+ #include <rex/cvar.h>
+ #include <rex/math.h>
+ #include <rex/hook.h>
+@@ -48,6 +52,50 @@ constexpr uint32_t kDefaultGrowthSegmentSize = 64u * 1024u * 1024u;
+ constexpr uint32_t HEAP_ZERO_MEMORY = 0x00000008;
+ #endif
+ 
++// nb patch 0004: free-validation guard.
++// Every live allocation carries kLiveMagic in SizeHeader::reserved; Free() flips it to
++// kFreedMagic. o1heap validates nothing in release builds, so a foreign pointer, a double
++// free or an underflow into the sixteen bytes before a block corrupts its bins and crashes
++// later (seen as a write to 0x3C in o1heapFree, reached from the game's meInternalFree).
++// A free that fails the checks is logged with the guest return address and skipped.
++constexpr uint64_t kLiveMagic = 0x2150414548584552ull;   // "REXHEAP!"
++constexpr uint64_t kFreedMagic = 0x2144454552465845ull;  // "EXFREED!"
++
++// o1heap's private FragmentHeader (o1heap.c): {Fragment* next; uintptr_t prev_used;},
++// O1HEAP_ALIGNMENT bytes immediately before the payload o1heap hands out.
++struct O1FragmentHeaderView {
++  uintptr_t next;
++  uintptr_t prev_used;
++};
++
++bool FragmentHeaderLooksSane(const void* payload, uintptr_t arena_lo, uintptr_t arena_hi) {
++  auto* fh = reinterpret_cast<const O1FragmentHeaderView*>(
++      static_cast<const uint8_t*>(payload) - O1HEAP_ALIGNMENT);
++  auto in_arena = [&](uintptr_t p) {
++    return p == 0 || (p >= arena_lo && p < arena_hi && (p % O1HEAP_ALIGNMENT) == 0);
++  };
++  if ((fh->prev_used & 1u) == 0) {
++    return false;  // o1heap already considers this fragment free
++  }
++  return in_arena(fh->next) && in_arena(fh->prev_used & ~uintptr_t{1});
++}
++
++uint32_t GuestReturnAddress() {
++  auto* ts = rex::runtime::ThreadState::Get();
++  return ts ? static_cast<uint32_t>(ts->context()->lr) : 0;
++}
++
++void ReportRejected(const char* op, uint32_t guest_addr, uint64_t requested_size, uint64_t reserved) {
++  static std::atomic<uint32_t> count{0};
++  const uint32_t n = ++count;
++  if (n > 32 && (n % 1024) != 0) {
++    return;
++  }
++  const char* verdict = reserved == kFreedMagic ? "double free" : "not a live allocation";
++  REXKRNL_WARN("rexcrt_{}: rejected 0x{:08X} ({}; header size={} tag=0x{:016X}) from guest lr 0x{:08X} [{}]",
++               op, guest_addr, verdict, requested_size, reserved, GuestReturnAddress(), n);
++}
++
+ }  // namespace
+ 
+ // ---------------------------------------------------------------------------
+@@ -114,6 +162,14 @@ void ReXHeap::Free(uint32_t guest_addr) {
+   }
+ 
+   void* real_host = GuestToHost(guest_addr - kHeaderSize);
++  auto* hdr = static_cast<SizeHeader*>(real_host);
++  const auto arena_lo = reinterpret_cast<uintptr_t>(GuestToHost(segment->guest_base));
++  const auto arena_hi = reinterpret_cast<uintptr_t>(GuestToHost(segment->guest_end));
++  if (hdr->reserved != kLiveMagic || !FragmentHeaderLooksSane(real_host, arena_lo, arena_hi)) {
++    ReportRejected("RtlFreeHeap", guest_addr, hdr->requested_size, hdr->reserved);
++    return;
++  }
++  hdr->reserved = kFreedMagic;
+   o1heapFree(segment->heap, real_host);
+ }
+ 
+@@ -128,6 +184,10 @@ uint32_t ReXHeap::Size(uint32_t guest_addr) {
+   }
+ 
+   auto* hdr = static_cast<SizeHeader*>(GuestToHost(guest_addr - kHeaderSize));
++  if (hdr->reserved != kLiveMagic) {
++    ReportRejected("RtlSizeHeap", guest_addr, hdr->requested_size, hdr->reserved);
++    return ~0u;
++  }
+   return static_cast<uint32_t>(hdr->requested_size);
+ }
+ 
+@@ -150,6 +210,10 @@ uint32_t ReXHeap::Realloc(uint32_t guest_addr, uint32_t new_size, bool zero_new)
+   void* real_host = GuestToHost(guest_addr - kHeaderSize);
+ 
+   auto* old_hdr = static_cast<SizeHeader*>(real_host);
++  if (old_hdr->reserved != kLiveMagic) {
++    ReportRejected("RtlReAllocateHeap", guest_addr, old_hdr->requested_size, old_hdr->reserved);
++    return AllocLocked(new_size, zero_new);
++  }
+   uint32_t old_size = static_cast<uint32_t>(old_hdr->requested_size);
+   void* new_ptr = o1heapReallocate(segment->heap, real_host, new_size + kHeaderSize);
+   if (!new_ptr) {
+@@ -168,12 +232,14 @@ uint32_t ReXHeap::Realloc(uint32_t guest_addr, uint32_t new_size, bool zero_new)
+       std::memset(static_cast<uint8_t*>(new_user_ptr) + old_size, 0, new_size - old_size);
+     }
+ 
++    old_hdr->reserved = kFreedMagic;
+     o1heapFree(segment->heap, real_host);
+     return new_guest;
+   }
+ 
+   auto* new_hdr = static_cast<SizeHeader*>(new_ptr);
+   new_hdr->requested_size = new_size;
++  new_hdr->reserved = kLiveMagic;
+ 
+   void* user_ptr = static_cast<uint8_t*>(new_ptr) + kHeaderSize;
+   if (zero_new && new_size > old_size) {
+@@ -248,7 +314,7 @@ uint32_t ReXHeap::AllocLocked(uint32_t size, bool zero) {
+ 
+     auto* hdr = static_cast<SizeHeader*>(ptr);
+     hdr->requested_size = size;
+-    hdr->reserved = 0;
++    hdr->reserved = kLiveMagic;
+ 
+     void* user_ptr = static_cast<uint8_t*>(ptr) + kHeaderSize;
+     if (zero) {

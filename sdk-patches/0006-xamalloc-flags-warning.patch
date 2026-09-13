@@ -1,0 +1,21 @@
+diff --git a/src/kernel/xam/xam_info.cpp b/src/kernel/xam/xam_info.cpp
+index 1fda053..32c3bf9 100644
+--- a/src/kernel/xam/xam_info.cpp
++++ b/src/kernel/xam/xam_info.cpp
+@@ -294,7 +294,15 @@ void XamLoaderTerminateTitle_entry() {
+ }
+ 
+ u32 XamAlloc_entry(u32 unk, u32 size, mapped_u32 out_ptr) {
+-  assert_true(unk == 0);
++  // nb patch 0006: Nuts & Bolts passes a non-zero first argument; Xenia asserts it is zero,
++  // which halted every Debug build. Report each distinct value once and carry on.
++  if (unk != 0) {
++    static uint32_t seen = 0xFFFFFFFFu;
++    if (seen != unk) {
++      seen = unk;
++      REXKRNL_WARN("XamAlloc: unhandled flags 0x{:08X} (size {})", unk, size);
++    }
++  }
+ 
+   // Allocate from the heap. Not sure why XAM does this specially, perhaps
+   // it keeps stuff in a separate heap?

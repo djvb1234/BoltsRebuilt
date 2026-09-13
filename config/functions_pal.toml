@@ -1,0 +1,4 @@
+# Space for independently documented function-boundary additions on the supported
+# PAL executable. Keep the discovery method alongside each future entry.
+
+[functions]

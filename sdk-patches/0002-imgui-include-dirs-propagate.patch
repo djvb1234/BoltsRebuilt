@@ -1,0 +1,15 @@
+diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
+index 984b97d..324ffc0 100644
+--- a/src/kernel/CMakeLists.txt
++++ b/src/kernel/CMakeLists.txt
+@@ -67,3 +67,10 @@ list(TRANSFORM REXKERNEL_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
+ target_sources(rexruntime PRIVATE ${REXKERNEL_SOURCES})
+ 
+ target_link_libraries(rexruntime PRIVATE o1heap rexcore rexfilesystem rexui rexaudio rexinput imgui)
++
++# The public header rex/ui/style.h includes <imgui.h> (and flows into rex/rex_app.h),
++# so consumers built in add_subdirectory mode need imgui's include dirs. The installed
++# SDK already ships the imgui headers in include/, hence BUILD_INTERFACE only.
++# Upstream: rexglue/rexglue-sdk PR #423 (open at v0.10.0).
++target_include_directories(rexruntime PUBLIC
++  $<BUILD_INTERFACE:$<TARGET_PROPERTY:imgui,INTERFACE_INCLUDE_DIRECTORIES>>)

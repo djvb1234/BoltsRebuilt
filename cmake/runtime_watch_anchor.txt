@@ -1,0 +1,4 @@
+  uint8_t* protect_base = membase_ + heap_base_;
+  uint32_t protect_system_page_first = UINT32_MAX;
+  auto global_lock = global_critical_region_.Acquire();
+  for (uint32_t i = system_page_first; i <= system_page_last; ++i) {

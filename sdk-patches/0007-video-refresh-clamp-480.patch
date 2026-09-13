@@ -1,0 +1,13 @@
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+index 1254710..34a1a65 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+@@ -74,7 +74,7 @@ uint32_t GetConfiguredVideoModeHeight() {
+ }
+ 
+ float GetConfiguredVideoModeRefreshRate() {
+-  double refresh_rate_hz = std::clamp(REXCVAR_GET(video_mode_refresh_rate), 24.0, 240.0);
++  double refresh_rate_hz = std::clamp(REXCVAR_GET(video_mode_refresh_rate), 24.0, 480.0);
+   return float(refresh_rate_hz);
+ }
+ 

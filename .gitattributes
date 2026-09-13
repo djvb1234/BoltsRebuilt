@@ -1,6 +1,10 @@
-* text=auto
+* text=auto eol=lf
 *.md text eol=lf
 *.png binary
 *.jpg binary
 *.jpeg binary
 *.webp binary
+# A unified diff uses a single space for an empty context line.
+*.patch whitespace=-blank-at-eol,-blank-at-eof
+# Preserve the supplied third-party notice verbatim.
+third_party/sdl_gamecontrollerdb/LICENSE -whitespace

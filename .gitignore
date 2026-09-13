@@ -1,9 +1,32 @@
-# Publication allowlist: explicitly admit reviewed files as they are published.
-# This workspace also contains game images, archives, and nested source trees.
+# Admit reviewed source directories; local inputs and build output remain private.
 /*
 !/.gitignore
 !/.gitattributes
 !/README.md
+!/LICENSE
+!/LICENSES/
+!/THIRD_PARTY_NOTICES.md
+!/CONTRIBUTING.md
+!/CMakeLists.txt
+!/CMakePresets.json
+!/src/
+!/cmake/
+!/config/
+!/sdk-patches/
+!/tools/
+!/third_party/
+!/docs/
+!/.github/
+!/generated/
+/generated/*
+!/generated/rexglue.cmake
+/.local/
+/.deps/
+/reference/
+/config/functions.toml
+/config/engine_funcs.toml
+/config/gpu_funcs.toml
+/config/crt.toml
 
 # Keep secrets and local artifacts excluded inside future admitted directories.
 .env
@@ -29,3 +52,21 @@ __pycache__/
 .vscode/
 build/
 out/
+*.obj
+*.lib
+*.cso
+*.dxbc
+*.ucode
+*.ucode.*
+*.xsh
+*.xexp
+*.caff
+*.dds
+*.rdc
+*.pix
+native_shaders/
+native_shader_cache/
+shader_dump/
+shader-dump/
+shadercache/
+shader_storage/

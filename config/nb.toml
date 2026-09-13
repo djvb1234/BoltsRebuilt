@@ -1,0 +1,59 @@
+# Runtime defaults, copied beside nb.exe at build time.
+# tools/play.ps1 supplies your local game path, native/capture mode and aspect.
+gpu_plugin = "nb"
+fullscreen = false
+
+# Compatibility settings for the supported PAL base executable.
+gpu_allow_invalid_fetch_constants = true
+direct_host_resolve = false
+readback_memexport = false
+async_shader_compilation = true
+
+# Bound unclipped screen-space draws and reduce render-target transfer work.
+# The individual switches retain comparison paths for diagnosing regressions.
+execute_unclipped_draw_vs_on_cpu = true
+nb_transfer_stencil_coverage = true
+nb_texture_layout_memo = true
+nb_scaled_resolve_memo = true
+
+# Serialize streaming pool reset/lookup; trace remains enabled for preview reports.
+nb_pool_trace = true
+nb_pool_reset_lock = true
+
+nb_m1_force_single_tile = false
+nb_m1_disable_scene_msaa = false
+nb_m1_log_tiling = false
+nb_m1_log_swap = false
+
+# Detailed per-draw inventory is opt-in.
+nb_cp_records_enable = false
+nb_cp_records_file = "nb_records/cp_records.jsonl"
+nb_cp_records_period = 600
+nb_cp_records_frames = 2
+
+# Procedural diagnostic shader; leave disabled for normal play.
+nb_native_demo = false
+nb_native_demo_ps = ""
+
+# Reserved compatibility switches. Hand-transcribed game shader implementations
+# are excluded from this preview; these paths always decline the draw.
+nb_native_bloom = false
+nb_native_bloom_blur = false
+nb_native_dof = false
+nb_native_sprite = false
+
+# Locally generated shader library; unsupported draws use SDK fallback.
+nb_native_generic = true
+nb_native_shader_dir = ""
+nb_native_shader_filter = ""
+nb_native_shader_exclude = ""
+nb_native_stencil = true
+
+# The guest normally presents every second vblank: 480 Hz permits up to 240 FPS.
+# Some frame-counted behavior can run faster; use 60 for the original 30 FPS cap.
+# This is a pacing limit, not an expected performance figure.
+video_mode_refresh_rate = 480.0
+vsync = true
+
+# Use tools/play.ps1 -Ultrawide '32:9' [-RenderScale '4x2'] -Fullscreen.
+nb_ultrawide = "off"

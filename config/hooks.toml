@@ -1,0 +1,67 @@
+# Mid-assembly hooks for the PAL default.xex. Every entry cites the generated-code lines it hooks
+# (generated/default/nb_recomp.N.cpp) and the hook function lives under src/hooks/.
+#
+# Hook functions are plain C++ in the global namespace: `bool name(PPCRegister& rA, ...)` when the
+# entry has a jump_address_on_true/false, `void name(...)` otherwise; registers arrive in the order
+# listed here. (Convention verified against the SDK codegen and reNut's hooks.)
+
+# meInternalFree (0x82364250, nb_recomp.148.cpp): after `bl sub_82240178` (the owner probe that
+# asks each game heap `RtlSizeHeap(heap[i], 0, ptr)` and returns the owning heap index or -1), the
+# game computes the heap descriptor from the index and, for -1, ends up with a null descriptor
+# that it dereferences at 0x823642D4 (`lwz r3,36(r31)`). Under our thread timing a block freed
+# by the XACT audio re-init is freed again by the main tick about nine seconds after boot
+# (docs/known_issues.md). When the probe returns -1 we jump to 0x82364340, the unlock-and-return
+# tail (`bl 0x822402a8; addi r4,r3,1; addi r3,r26,8; bl 0x82240518; epilogue`), skipping the size
+# query, the free and the statistics update, and also skipping the per-thread slot save/restore
+# pair (0x823642EC/0x8236433C) that the skipped region owns.
+[[midasm_hook]]
+address = 0x823642A8
+name = "nb_meInternalFree_skip_unowned"
+registers = ["r3", "r29"]
+after_instruction = false
+jump_address_on_true = 0x82364340
+
+# Milestone-1 policy hooks (src/hooks/hooks_m1.cpp): zero the MultiSample argument at the three scene-surface
+# sites in sub_823ED2A8 when nb_m1_disable_scene_msaa is set. The tile-count lever is a whole-function hook
+# on sub_8222A990 in the same file and needs no entry here.
+# Site 1: sub_823ED2A8, `bl 0x8231a808` (XGSurfaceSize) at 0x823ED544 (ctx.lr = 0x823ED548,
+# nb_recomp.96.cpp:6282-6284). Called with the DEPTH format 0x1A220197 (r5 = r25); the result
+# is stored to r1+112 = D3DSURFACE_PARAMETERS.Base of the color surface created at site 2.
+# r6 = MSAA level. Zeroed so the color surface's EDRAM base equals the 1x depth footprint.
+[[midasm_hook]]
+address = 0x823ED544
+name = "nb_msaa_off_color_size"
+registers = ["r6"]
+
+# Site 2 (reNut disable_msaa_color): `bl 0x82655fe8` rex_D3DDevice_CreateSurface at
+# 0x823ED594 (ctx.lr = 0x823ED598, nb_recomp.96.cpp:6326-6328), color scene surface,
+# r5 = 0x18280186, r6 = MultiSample, r7 = r1+112 (surface parameters).
+[[midasm_hook]]
+address = 0x823ED594
+name = "nb_msaa_off_color_surface"
+registers = ["r6"]
+
+# Site 3 (reNut disable_msaa_depth): `bl 0x82655fe8` rex_D3DDevice_CreateSurface at
+# 0x823ED6E4 (ctx.lr = 0x823ED6E8, nb_recomp.96.cpp:6508-6510), depth scene surface,
+# r5 = 0x1A220197, r6 = MultiSample, r7 = r1+112 with Base = 0.
+[[midasm_hook]]
+address = 0x823ED6E4
+name = "nb_msaa_off_depth_surface"
+registers = ["r6"]
+
+# Worker message pump sub_82327560 (nb_recomp.133.cpp): the type-21 message ("pump the XACT engine until
+# idle") is dispatched to the loop at loc_823275EC and every message leaves through loc_82327710. r28 holds
+# the message pointer from `mr r28,r3` after the dequeue until the loop restarts. The two hooks time the
+# job per thread (src/hooks/pool_trace_hooks.cpp) so the log shows whether a boot-time load job is still
+# running when the audio re-init resets the streaming pools (docs/known_issues.md).
+[[midasm_hook]]
+address = 0x823275EC
+name = "nb_pool_trace_worker_job_round"
+registers = ["r28"]
+after_instruction = false
+
+[[midasm_hook]]
+address = 0x82327710
+name = "nb_pool_trace_worker_job_exit"
+registers = ["r28"]
+after_instruction = false

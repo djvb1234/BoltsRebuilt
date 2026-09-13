@@ -1,0 +1,24 @@
+name: Build or setup problem
+description: Report trouble building locally or preparing shaders.
+title: "[Setup] "
+body:
+  - type: input
+    id: revision
+    attributes:
+      label: Commit tested
+    validations:
+      required: true
+  - type: textarea
+    id: tools
+    attributes:
+      label: Tool versions and command
+      description: Windows, Visual Studio, Clang, CMake, Python, and the command that failed. Redact personal paths.
+    validations:
+      required: true
+  - type: textarea
+    id: error
+    attributes:
+      label: Error excerpt
+      description: Include the first relevant error as text. Do not upload game data, generated code, shader dumps or memory dumps.
+    validations:
+      required: true

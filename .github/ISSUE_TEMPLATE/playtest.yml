@@ -1,0 +1,37 @@
+name: Playtest result
+description: Report rendering, gameplay, or performance findings from your local build.
+title: "[Playtest] "
+body:
+  - type: markdown
+    attributes:
+      value: "Please do not attach game files, shaders/caches, generated code, saves, or memory dumps. Review log excerpts for personal paths."
+  - type: input
+    id: revision
+    attributes:
+      label: Commit tested
+      description: Output of git rev-parse --short HEAD.
+    validations:
+      required: true
+  - type: textarea
+    id: system
+    attributes:
+      label: Hardware and settings
+      description: Windows version, CPU, GPU, driver, display aspect, render scale, and changed options.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Scene and reproduction steps
+      description: What happened, what you expected, and how to reproduce it.
+    validations:
+      required: true
+  - type: textarea
+    id: comparison
+    attributes:
+      label: Native versus fallback comparison
+      description: Does F5 change the problem? Were local shaders prepared and warm? Give measurement windows for performance claims.
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional observations

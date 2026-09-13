@@ -1,0 +1,29 @@
+  uint8_t* protect_base = membase_ + heap_base_;
+  uint32_t protect_system_page_first = UINT32_MAX;
+  auto global_lock = global_critical_region_.Acquire();
+  // All requested notification bits already set implies that the original
+  // loop cannot change a bit or protect a page. The helper also proves that
+  // every skipped guest-page lookup is in range, preserving OOB diagnostics.
+  if (enable_invalidation_notifications && !enable_data_providers) {
+    const uint32_t watch_mode = ::nb::runtime::GetWatchFastpathMode();
+    // A/C aliases use larger guest pages. When these pages are inaccessible or
+    // read-only, the original loop also has no effects, regardless of watch bits.
+    if ((watch_mode & ::nb::runtime::kWatchGuestImmutable) &&
+        ::nb::runtime::AllGuestPagesImmutable(
+            system_page_first, system_page_last, system_page_size_,
+            system_page_count_, page_size_shift_, host_address_offset(),
+            page_table_.size(), system_page_flags_, [this](size_t guest) noexcept {
+              return ToPageAccess(page_table_[guest].current_protect) !=
+                     rex::memory::PageAccess::kReadWrite;
+            })) {
+      return;
+    }
+    if ((watch_mode & ::nb::runtime::kWatchAlreadyEnabled) &&
+        ::nb::runtime::AllNotificationPagesWatched(
+            system_page_first, system_page_last, system_page_size_,
+            system_page_count_, page_size_shift_, host_address_offset(),
+            page_table_.size(), system_page_flags_)) {
+      return;
+    }
+  }
+  for (uint32_t i = system_page_first; i <= system_page_last; ++i) {

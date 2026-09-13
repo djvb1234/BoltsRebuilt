@@ -1,0 +1,15 @@
+name: Source checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  publication:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python tools/check_publication.py --head
+      - run: python -m unittest discover -s tools -p 'test_*.py'
+      - run: git show --check --oneline HEAD

@@ -1,0 +1,24 @@
+diff --git a/src/audio/audio_system.cpp b/src/audio/audio_system.cpp
+index 7a711a8..e239b41 100644
+--- a/src/audio/audio_system.cpp
++++ b/src/audio/audio_system.cpp
+@@ -271,8 +271,17 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
+   }
+ 
+   auto global_lock = global_critical_region_.Acquire();
+-  assert_true(index < kMaximumClientCount);
+-  assert_true(clients_[index].driver != NULL);
++  // nb patch 0005: a frame can arrive for a client that was just unregistered (the game
++  // re-creates its audio device shortly after boot); in release builds the asserts below
++  // are compiled out and the null driver crashed the process. Drop the frame instead.
++  if (index >= kMaximumClientCount || clients_[index].driver == nullptr) {
++    static uint32_t dropped = 0;
++    if (++dropped <= 8 || (dropped % 1000) == 0) {
++      REXAPU_WARN("AudioSystem::SubmitFrame: no driver for client {} (dropped {} frames)", index,
++                  dropped);
++    }
++    return;
++  }
+   (clients_[index].driver)->SubmitFrame(samples_ptr);
+ }
+ 
