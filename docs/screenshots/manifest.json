@@ -1,0 +1,64 @@
+{
+  "images": [
+    {
+      "file": "showdown-town-32x9.png",
+      "sha256": "61c5cca0be88781f34fd11adbc3c0cf04c07e5bd09fe2ba3d043c8c4652d2b3e",
+      "captured_at_utc": "2026-09-12T02:30:20.1591961Z",
+      "width": 5120,
+      "height": 1440,
+      "source_capture": "native_uw_session_uw_4x2_uw15on_20260911-222838-86f54be5d0a64fdaad435f0f58a353aa/uw_on.png",
+      "description": "Full 32:9 output; 4x2 internal render scale (5120x1440).",
+      "processing": "Original PNG copied byte-for-byte; no new crop, resize, retouching or generated content."
+    },
+    {
+      "file": "showdown-town-16x9.png",
+      "sha256": "62d6780cacfa00bdf2e225e37f71f4066d3910270ee7301be7d2072a8ed52dbe",
+      "captured_at_utc": "2026-09-12T02:30:24.0183384Z",
+      "width": 5120,
+      "height": 1440,
+      "source_capture": "native_uw_session_uw_4x2_uw15on_20260911-222838-86f54be5d0a64fdaad435f0f58a353aa/uw_off_16x9.png",
+      "description": "16:9 view with side bars on the same 5120x1440 display; captured later in the same session.",
+      "processing": "Original PNG copied byte-for-byte; no new crop, resize, retouching or generated content."
+    },
+    {
+      "file": "town-street.png",
+      "sha256": "add7719c3a937e4b6c8a5f969b99d0e3c08470104f6ff05dc41dbd65e5fb843d",
+      "captured_at_utc": "2026-09-10T09:44:10.6132149Z",
+      "width": 1618,
+      "height": 947,
+      "source_capture": "native_drive_street_20260910-054156-23eaf50b8c2f484ab592efa8a53e89b7/native_final.png",
+      "description": "Windowed street view with native rendering enabled.",
+      "processing": "Original PNG copied byte-for-byte; no new crop, resize, retouching or generated content."
+    },
+    {
+      "file": "town-at-night.png",
+      "sha256": "534f24a3b9cf3573dff1d301a4a0e6524c675cd69651685a432603b783981eaa",
+      "captured_at_utc": "2026-09-10T09:49:36.1420555Z",
+      "width": 1618,
+      "height": 947,
+      "source_capture": "native_drive_rightturn_20260910-054737-8cf42dd65dae40ab844553020536911a/drive_118.png",
+      "description": "Windowed driving capture near a world portal.",
+      "processing": "Original PNG copied byte-for-byte; no new crop, resize, retouching or generated content."
+    },
+    {
+      "file": "town-daylight-detail.png",
+      "sha256": "699a9e5260012e674b4e766597cc6bee65f122ab7ba3e625f3bd96f269e8bc8b",
+      "captured_at_utc": "2026-09-12T03:57:07.1420224Z",
+      "width": 2560,
+      "height": 1440,
+      "source_capture": "native_uw_session_uw_2x2_uw17on_20260911-235525-2903a142a7ae4aa6aafb1dbd3364319f/uw_on_centre.png",
+      "description": "Existing 2560x1440 center crop of the 32:9 output; 2x2 internal render scale.",
+      "processing": "Original PNG copied byte-for-byte; no new crop, resize, retouching or generated content."
+    },
+    {
+      "file": "world-entry.png",
+      "sha256": "4a39b527484161d7d50768dad33ebb6047c9dbb64e51942e51ca7a17985d89fb",
+      "captured_at_utc": "2026-09-10T09:23:07.3857914Z",
+      "width": 1618,
+      "height": 947,
+      "source_capture": "native_drive_arc_20260910-052110-5fd19a5053fe4d27868fe258f21a1063/drive_116.png",
+      "description": "Windowed world-entry interface during a driving test.",
+      "processing": "Original PNG copied byte-for-byte; no new crop, resize, retouching or generated content."
+    }
+  ]
+}

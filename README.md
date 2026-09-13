@@ -1,79 +1,126 @@
 # BoltsRebuilt
 
-A static recompilation of **Banjo-Kazooie: Nuts & Bolts** for Windows, built on
-[RexGlue](https://github.com/rexglue/rexglue-sdk) with a custom native Direct3D 12
-renderer, shader translation tools, and ultrawide support.
+**Banjo-Kazooie: Nuts & Bolts on Windows, with native Direct3D 12 rendering and ultrawide support.**
 
-**Source-only developer preview.** To play, you need the supported PAL base-game
-extraction and must build locally. This repository contains no game executable,
-assets, captured shaders, or generated game C++.
+BoltsRebuilt is a static recompilation project built on
+[RexGlue](https://github.com/rexglue/rexglue-sdk). It includes the host application,
+a custom GPU plugin, shader translation tools, game compatibility hooks, and
+the profiling tools used to develop them.
 
-**[Build and play](docs/BUILDING.md)** · **[Report a playtest issue](https://github.com/djvb1234/BoltsRebuilt/issues/new/choose)** · **[Source provenance](docs/PROVENANCE.md)**
+[Build and play](docs/BUILDING.md) · [Screenshots](docs/SCREENSHOTS.md) · [How it works](docs/ARCHITECTURE.md) · [Report an issue](https://github.com/djvb1234/BoltsRebuilt/issues/new/choose)
 
-## What is implemented
+[![Showdown Town at sunset, rendered across a 32:9 display with a centered HUD](docs/screenshots/showdown-town-32x9.png)](docs/screenshots/showdown-town-32x9.png)
 
-- A custom GPU plugin that replaces supported guest draws with native D3D12 draws.
-- A shader-to-HLSL translator, runtime shader library, background compilation,
-  and pipeline caching. Shader inputs come from each tester's own local game.
-- Native geometry drawing with guest vertex/index data, up to sixteen vertex
-  streams, stencil state, and supported cube-texture fetches.
-- Command recording/replay, constant upload, shared-memory, texture lookup,
-  render-target transfer and resolve optimizations, with diagnostic controls.
-- 21:9 and 32:9 camera support: wider horizontal field of view, matching culling,
-  a centered HUD, and configurable internal rendering up to 5120x1440.
-- Scripted controller input, frame/camera overlays, CPU/GPU probes, and focused
-  renderer correctness tests.
+*Showdown Town at 5120 × 1440, with 32:9 framing and the HUD kept at its original
+proportions. Development capture; see the [gallery notes](docs/SCREENSHOTS.md)
+for dates and configuration.*
 
-The renderer uses RexGlue's Xenia-derived command-stream and resource
-infrastructure. Unsupported shaders or rendering state retain per-draw fallback.
-Coverage and performance vary by scene; completing and validating the whole game
-remain ongoing work. The internal application/plugin names `nb` and `rexgpu-nb`
-are retained for compatibility.
+## The implementation
 
-## Try it
+The renderer replaces supported guest draws with native D3D12 draws, using
+shaders translated from your own game. It builds on RexGlue's Xenia-derived
+command-stream and resource infrastructure, with per-draw fallback for unsupported
+shaders and rendering state.
 
-Install the Windows C++/Clang build tools listed in the
-[build guide](docs/BUILDING.md), then:
+| Area | Included work |
+| --- | --- |
+| Native renderer | Geometry, vertex/index streams, stencil state, texture and sampler bindings, shader libraries, and pipeline caching. |
+| Shader translation | Local shader capture, translation to HLSL, stage validation, background compilation, and fallback when a shader is unsupported. |
+| Ultrawide | 21:9 and 32:9 views, wider horizontal field of view, matching culling, a centered HUD, and configurable internal render scale. |
+| Runtime integration | Game compatibility hooks, controller input, audio integration, and local save/cache paths. |
+| Development tools | Scripted controller runs, frame and camera overlays, CPU/GPU timing probes, and focused correctness tests. |
+
+Command recording and replay, memory uploads, texture lookups, render-target
+transfers, and resolves are also active areas of optimization.
+The [architecture guide](docs/ARCHITECTURE.md) explains how the pieces fit together.
+
+## In game
+
+| Showdown Town | After dark |
+| --- | --- |
+| [![Driving through Showdown Town beside Mumbo's Motors](docs/screenshots/town-street.png)](docs/screenshots/town-street.png) | [![A lit world portal in Showdown Town at night](docs/screenshots/town-at-night.png)](docs/screenshots/town-at-night.png) |
+
+The [screenshot gallery](docs/SCREENSHOTS.md) includes the ultrawide comparison,
+a closer HUD view, and the world-entry interface. These are real development
+captures. Frame-rate overlays are individual observations, not benchmark results
+for the public preview.
+
+## Build and play
+
+This is a **source-only developer preview**. You provide the supported game
+extraction and build locally; game files and a prebuilt game executable are not
+distributed here.
+
+| Requirement | Current target |
+| --- | --- |
+| Platform | Windows x64 with a Direct3D 12 GPU |
+| Game | PAL base-game extraction; title updates are not supported |
+| Tools | PowerShell 7, Git, Python 3.11+, Visual Studio 2022 C++/Clang tools, and a Windows SDK |
+| Build dependency | RexGlue v0.10.0, downloaded at a pinned revision by the helper |
+
+Follow the [full build guide](docs/BUILDING.md) for the required components and
+supported executable hash. Once the tools are installed:
 
 ```powershell
 git clone https://github.com/djvb1234/BoltsRebuilt.git
 cd BoltsRebuilt
 & .\tools\build-local.ps1 -GameRoot 'D:\Games\NutsAndBolts'
 & .\tools\play.ps1 -CaptureShaders
-# Close the game after visiting the areas you want to test.
+```
+
+Visit the areas you want to test, then close the game. Prepare those shaders
+and launch with native rendering enabled:
+
+```powershell
 & .\tools\prepare-shaders.ps1
 & .\tools\play.ps1
 ```
 
-The helper checks your executable's identity, downloads a pinned SDK, applies
-the included source patches, and generates/builds game code on your machine.
-Captures, generated files, builds, saves and game paths stay in ignored local
-directories. Native rendering becomes available as you capture and prepare
-supported shaders; other draws continue through fallback.
+For a 32:9 display:
 
-## Feedback
+```powershell
+& .\tools\play.ps1 -Ultrawide '32:9' -Fullscreen
+```
 
-Report the commit, hardware/driver, scene, reproduction steps, aspect ratio and
-render scale. F5 toggles native draws for a useful comparison. Please report visual
-errors as well as frame rate changes. See [contributing](CONTRIBUTING.md).
+Generated game code, shaders, builds, saves, and local game paths stay in ignored
+directories. Unsupported draws continue through fallback as you build up your
+local shader library.
 
-Do not attach game files, shader programs/caches, generated game code, saves or
-memory dumps. Review log excerpts for personal paths before sharing them.
-Screenshots and reproducible benchmark reports will be added as they are prepared;
-private-build performance figures are not measurements of this public preview.
-The initial [validation record](docs/VALIDATION.md) states what was checked.
+## Project status and feedback
+
+The initial source preview builds on Windows and has passed title-screen launch
+checks. Full-game compatibility, native rendering coverage, and performance
+testing remain ongoing. The [validation record](docs/VALIDATION.md) lists the
+checks performed and their limits.
+
+Playtest reports are useful even when something works. Include your commit,
+hardware and driver, scene, aspect ratio, and render scale. For rendering problems,
+use **F5** to compare with native draws disabled and describe what changes.
+The [issue forms](https://github.com/djvb1234/BoltsRebuilt/issues/new/choose) guide
+you through the details. See [contributing](CONTRIBUTING.md) before attaching logs
+or submitting code.
+
+## Documentation
+
+- [Build and play](docs/BUILDING.md) — installation, local shaders, controls, and ultrawide settings.
+- [Screenshot gallery](docs/SCREENSHOTS.md) — captures, aspect comparison, and image provenance.
+- [Architecture](docs/ARCHITECTURE.md) — runtime, rendering paths, and source layout.
+- [Validation](docs/VALIDATION.md) — what has been tested for the source preview.
+- [Source provenance](docs/PROVENANCE.md) — origins of the code and compatibility data.
 
 ## License and credits
 
 Original BoltsRebuilt contributions are licensed under **GPL-3.0-only**;
-see [LICENSE](LICENSE). If you distribute a modified version, GPLv3 requires
-offering its corresponding source to recipients under the same license. It
-allows commercial use and does not require publishing private changes or sending
-changes back to this repository.
+see [LICENSE](LICENSE). Distributed modified versions must make their corresponding
+source available under GPLv3. Commercial use is allowed; private changes do not
+have to be published.
 
-Pre-existing third-party work retains its own license and copyright notices.
-See [third-party notices](THIRD_PARTY_NOTICES.md) for RexGlue, Xenia and the SDL
-controller database, and [provenance](docs/PROVENANCE.md) for compatibility data
-researched using reNut. The project license grants no rights to the original
-game or its trademarks. BoltsRebuilt is not affiliated with or endorsed by Rare
-or Microsoft.
+The project builds on work by the **RexGlue**, **Xenia**, and **SDL GameControllerDB**
+contributors, with compatibility research informed by **reNut**. Third-party code
+retains its own notices and licenses; see [third-party notices](THIRD_PARTY_NOTICES.md)
+and [source provenance](docs/PROVENANCE.md).
+
+Banjo-Kazooie: Nuts & Bolts and the game content visible in screenshots belong to
+their respective rights holders. The source-code license does not license that
+content or its trademarks. BoltsRebuilt is not affiliated with or endorsed by
+Rare or Microsoft.

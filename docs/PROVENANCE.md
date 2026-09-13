@@ -51,6 +51,17 @@ components. They are not a distributed library of the game's captured shaders.
 
 ## Before publishing later changes
 
+Reviewed documentation screenshots are listed in
+[`screenshots/manifest.json`](screenshots/manifest.json), with source capture
+names and exact content hashes. They illustrate local development builds and
+do not grant rights to the game content shown. See the
+[gallery](SCREENSHOTS.md) for context and image rights.
+
+The file gate has a narrow exception for these PNGs: the same staged/committed
+manifest must list each image, its SHA-256 must match, and the PNG structure,
+size and chunk checks must pass. Unlisted images, text/EXIF payloads and other
+binary files are still rejected.
+
 Review every staged path and its provenance, retain required notices, then run:
 
 ```powershell

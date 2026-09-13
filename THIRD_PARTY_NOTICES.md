@@ -25,3 +25,7 @@ future binary release.
 Banjo-Kazooie: Nuts & Bolts and its game content belong to their respective rights
 holders. The project license grants no rights to that content or to their trademarks.
 This project is not affiliated with or endorsed by Rare or Microsoft.
+
+The documentation screenshots show copyrighted game artwork and trademarks;
+they are not licensed under GPL-3.0-only by this project. See the
+[screenshot gallery](docs/SCREENSHOTS.md) for their capture context and provenance.
