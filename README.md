@@ -97,6 +97,13 @@ checks. Full-game compatibility, native rendering coverage, and performance
 testing remain ongoing. The [validation record](docs/VALIDATION.md) lists the
 checks performed and their limits.
 
+The [12 September development playtest](docs/benchmarks/2026-09-12-ultrawide/README.md)
+records the maintainer's reported early-level and Mumbo mission progress, with
+16 minutes of telemetry at native 5120 × 1440. It averaged **70.02 FPS game swap
+cadence across the whole session**, including menus and loading. The report
+includes a timeline, downloadable samples and settings; it used a private
+development build with local caches, so it is separate from public-preview validation.
+
 The maintainer's test machine is an **Intel Core Ultra 9 285K, NVIDIA GeForce RTX
 5070 Ti and 32 GB RAM**, running Windows 11 with a 5120 x 1440 display.
 [Full hardware and driver details](docs/TEST_HARDWARE.md) describe that configuration;
@@ -121,6 +128,7 @@ The [current priorities](docs/ROADMAP.md) describe where further testing and dev
 - [Troubleshooting](docs/TROUBLESHOOTING.md) — setup messages, shaders, settings and pacing.
 - [Compatibility](docs/COMPATIBILITY.md) — verified checks, known limits and untested areas.
 - [Test hardware](docs/TEST_HARDWARE.md) — the maintainer's machine and graphics driver.
+- [Development playtest](docs/benchmarks/2026-09-12-ultrawide/README.md) — partial progress and a native 5120 × 1440 performance recording.
 - [Screenshot gallery](docs/SCREENSHOTS.md) — captures, aspect comparison, and image provenance.
 - [Architecture](docs/ARCHITECTURE.md) — runtime, rendering paths, and source layout.
 - [Validation](docs/VALIDATION.md) — what has been tested for the source preview.

@@ -31,6 +31,10 @@ The public source built and reached the title screen on this machine. The native
 launch used a small local library of three vertex and three pixel shader stages,
 with fallback for other draws. See the [validation record](VALIDATION.md).
 
+A later [partial development playtest](benchmarks/2026-09-12-ultrawide/README.md)
+used this same CPU/GPU configuration and driver at native 5120 × 1440. Its report
+contains measured performance and reported progress for that private build.
+
 AMD GPUs, Intel GPUs, other NVIDIA models, laptops, other CPU configurations and
 other drivers have not been validated in the published record. **Untested means
 unknown, not incompatible.** Windows editions other than the one above are also

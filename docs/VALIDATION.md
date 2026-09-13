@@ -44,3 +44,16 @@ synthetic shader fixture and compiles/runs the standalone ultrawide parser/math
 checks. These jobs need no game files, SDK checkout, GPU or uploaded caches.
 Their result is source/tool validation, not a full application build or a gameplay
 compatibility result. Other standalone C++ tests are not yet all wired into CI.
+
+## Separate development playtest
+
+The [12 September 2026 partial playtest](benchmarks/2026-09-12-ultrawide/README.md)
+records the maintainer's reported early-level and Mumbo mission progress in a
+private development build, with native rendering enabled at 5120 × 1440.
+The 16-minute recording includes a performance timeline, numerical samples,
+hardware, runtime settings and binary hashes. The process exited with code 0;
+runtime fallback warnings and unimplemented queries were still present.
+
+This extends the documented development evidence. It does not extend the tagged
+public preview's launch validation, establish full-game compatibility, or assign
+performance measurements to individual missions.

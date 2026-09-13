@@ -1,7 +1,8 @@
 # Compatibility and known limitations
 
-This page records evidence for the public source preview. It is not a list of
-hardware presumed to fail. The only documented test machine is the maintainer's
+This page separates evidence for the public source preview from private
+development sessions. It is not a list of hardware presumed to fail. The only
+documented test machine is the maintainer's
 [Core Ultra 9 285K / RTX 5070 Ti system](TEST_HARDWARE.md).
 
 ## Current evidence
@@ -12,6 +13,7 @@ hardware presumed to fail. The only documented test machine is the maintainer's
 | Title screen with shader capture | Verified on the documented machine | The public build rendered the title screen using fallback while capturing shaders. |
 | Title screen with native draws enabled | Verified with a small local shader library | Three vertex and three pixel stages were installed; other draws retained fallback. |
 | Showdown Town and 32:9 screenshots | Development evidence | The gallery shows private development sessions. It does not establish equivalent coverage or performance in this public preview. |
+| Early-level and Mumbo mission progress at native 5120 × 1440 | Maintainer-reported development playtest | [12 September partial session](benchmarks/2026-09-12-ultrawide/README.md): reported progress, 16 minutes of telemetry and a normal process exit. Private build with local shaders/caches; named missions and completion were not independently checked. |
 | Full game, all worlds and challenges | Not established | A complete public-build playthrough has not been recorded. |
 | Save/reload across extended sessions | Not established | No public-preview regression record yet. |
 | Other hardware and driver combinations | Not established | Reports on other NVIDIA, AMD and Intel GPUs, CPUs and laptops are needed. |
