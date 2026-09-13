@@ -41,7 +41,7 @@ def plot(game, gpu):
 
     plt.rcParams.update({
         "font.family": "DejaVu Sans", "font.size": 10,
-        "svg.fonttype": "none", "svg.hashsalt": "boltsrebuilt-20260912",
+        "svg.fonttype": "path", "svg.hashsalt": "boltsrebuilt-20260912",
         "path.simplify": False,
         "axes.spines.top": False, "axes.spines.right": False,
     })
