@@ -1,11 +1,12 @@
 name: Build or setup problem
 description: Report trouble building locally or preparing shaders.
 title: "[Setup] "
+labels: [setup]
 body:
   - type: input
     id: revision
     attributes:
-      label: Commit tested
+      label: Release or commit tested
     validations:
       required: true
   - type: textarea

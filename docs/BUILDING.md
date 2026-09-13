@@ -6,7 +6,9 @@ not download game data, upload your files, or modify the source extraction.
 
 ## Requirements
 
-- Windows x64 and a Direct3D 12 GPU. Other platforms are not supported by this preview.
+- Windows x64 and a Direct3D 12 GPU. The compiler preset targets x86-64-v2.
+  Other platforms are not supported by this preview. See
+  [compatibility](COMPATIBILITY.md) and the [tested hardware](TEST_HARDWARE.md).
 - Your PAL base-game extraction, including `default.xex` and `Bundle/`.
 - The supported `default.xex` SHA-1 is `5be7c41a37e3fa1e8fa05f4a0815c9b807dcae74`
   (16,920,576 bytes). Other executables and title updates are rejected.
@@ -86,12 +88,21 @@ an unmodified upstream-Xenia comparison.
 The default guest refresh setting allows up to 240 FPS; it does not guarantee
 that performance. Some frame-counted behavior can speed up. To test original
 30 FPS pacing, set `video_mode_refresh_rate = 60.0` in the built application's
-`nb.toml`. Rebuilding restores the checked-in defaults.
+`nb.toml`. Defaults are copied after the application links; a no-op rebuild does
+not restore them. With the game closed, this command from the repository root
+restores the checked-in configuration (replacing any settings you saved there):
+
+```powershell
+Copy-Item -LiteralPath '.\config\nb.toml' -Destination '.\out\build\win-amd64-release\nb.toml'
+```
 
 The play helper uses `.local/user-data` for this preview's saves and caches, separate
 from other local `nb` installations. Back up saves you value before testing software.
 
 ## What to report
+
+The [first-playtest guide](FIRST_PLAYTEST.md) gives a short test sequence.
+See [troubleshooting](TROUBLESHOOTING.md) for common setup messages and settings.
 
 Use the repository's playtest issue form. Include the commit, CPU/GPU and driver,
 scene and steps, aspect/render scale, and whether the issue also happens with F5

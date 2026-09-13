@@ -13,3 +13,33 @@ jobs:
       - run: python tools/check_publication.py --head
       - run: python -m unittest discover -s tools -p 'test_*.py'
       - run: git show --check --oneline HEAD
+  windows-tools:
+    name: Windows helpers and ultrawide math
+    runs-on: windows-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check shader installation and rollback with synthetic inputs
+        # A separate process keeps intentionally rejected child exit codes inside
+        # the fixture. A failed assertion still exits this process unsuccessfully.
+        run: pwsh -NoProfile -File tools/test_gen_native_shaders.ps1 -Python python -ScratchRoot "$env:RUNNER_TEMP"
+      - name: Compile and run standalone ultrawide checks
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $vsInstall = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $vsInstall) { throw 'Visual Studio C++ tools were not found.' }
+          Import-Module (Join-Path $vsInstall 'Common7/Tools/Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $vsInstall -SkipAutomaticLocation -DevCmdArguments '-arch=amd64 -host_arch=amd64' | Out-Null
+          $testExecutable = Join-Path $env:RUNNER_TEMP 'test_ultrawide_math.exe'
+          $testObject = Join-Path $env:RUNNER_TEMP 'test_ultrawide_math.obj'
+          & cl.exe /nologo /EHsc /std:c++17 /W4 /Isrc/ultrawide tools/test_ultrawide_math.cpp "/Fo$testObject" "/Fe$testExecutable"
+          if ($LASTEXITCODE -ne 0) { throw 'Ultrawide test compilation failed.' }
+          & $testExecutable
+          if ($LASTEXITCODE -ne 0) { throw 'Ultrawide checks failed.' }

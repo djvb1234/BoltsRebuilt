@@ -1,7 +1,13 @@
 # Testing and contributing
 
-Start with [the local build guide](docs/BUILDING.md). Use the playtest issue form
+Start with [the local build guide](docs/BUILDING.md) and
+[first-playtest checklist](docs/FIRST_PLAYTEST.md). Use the playtest issue form
 for results and the setup issue form if you cannot build or prepare shaders.
+
+General questions and ideas belong in
+[Discussions](https://github.com/djvb1234/BoltsRebuilt/discussions).
+Working configurations are useful reports too. Check the
+[compatibility record](docs/COMPATIBILITY.md) and include your actual test scope.
 
 Include small reproduction steps and identify your commit and settings. Keep
 performance comparisons in the same scene and distinguish cold shader compilation

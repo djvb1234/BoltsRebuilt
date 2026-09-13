@@ -7,7 +7,7 @@ BoltsRebuilt is a static recompilation project built on
 a custom GPU plugin, shader translation tools, game compatibility hooks, and
 the profiling tools used to develop them.
 
-[Build and play](docs/BUILDING.md) · [Screenshots](docs/SCREENSHOTS.md) · [How it works](docs/ARCHITECTURE.md) · [Report an issue](https://github.com/djvb1234/BoltsRebuilt/issues/new/choose)
+[Preview release](https://github.com/djvb1234/BoltsRebuilt/releases/tag/v0.1.0-preview.1) · [Build and play](docs/BUILDING.md) · [First playtest](docs/FIRST_PLAYTEST.md) · [Screenshots](docs/SCREENSHOTS.md) · [Discussions](https://github.com/djvb1234/BoltsRebuilt/discussions)
 
 [![Showdown Town at sunset, rendered across a 32:9 display with a centered HUD](docs/screenshots/showdown-town-32x9.png)](docs/screenshots/showdown-town-32x9.png)
 
@@ -51,6 +51,10 @@ This is a **source-only developer preview**. You provide the supported game
 extraction and build locally; game files and a prebuilt game executable are not
 distributed here.
 
+Start with [v0.1.0-preview.1](https://github.com/djvb1234/BoltsRebuilt/releases/tag/v0.1.0-preview.1)
+for a named version to test. Its release notes describe the included source,
+requirements and known limits. The generated source archives are not a ready-to-run game.
+
 | Requirement | Current target |
 | --- | --- |
 | Platform | Windows x64 with a Direct3D 12 GPU |
@@ -93,6 +97,13 @@ checks. Full-game compatibility, native rendering coverage, and performance
 testing remain ongoing. The [validation record](docs/VALIDATION.md) lists the
 checks performed and their limits.
 
+The maintainer's test machine is an **Intel Core Ultra 9 285K, NVIDIA GeForce RTX
+5070 Ti and 32 GB RAM**, running Windows 11 with a 5120 x 1440 display.
+[Full hardware and driver details](docs/TEST_HARDWARE.md) describe that configuration;
+they are not minimum requirements. [Compatibility and known limitations](docs/COMPATIBILITY.md)
+separates verified checks from development captures and areas that still need testing.
+Other hardware is untested in the published record, not presumed incompatible.
+
 Playtest reports are useful even when something works. Include your commit,
 hardware and driver, scene, aspect ratio, and render scale. For rendering problems,
 use **F5** to compare with native draws disabled and describe what changes.
@@ -100,13 +111,21 @@ The [issue forms](https://github.com/djvb1234/BoltsRebuilt/issues/new/choose) gu
 you through the details. See [contributing](CONTRIBUTING.md) before attaching logs
 or submitting code.
 
+For questions and suggestions, use [Discussions](https://github.com/djvb1234/BoltsRebuilt/discussions).
+The [current priorities](docs/ROADMAP.md) describe where further testing and development can help.
+
 ## Documentation
 
 - [Build and play](docs/BUILDING.md) — installation, local shaders, controls, and ultrawide settings.
+- [First playtest](docs/FIRST_PLAYTEST.md) — a short test session and what to report.
+- [Troubleshooting](docs/TROUBLESHOOTING.md) — setup messages, shaders, settings and pacing.
+- [Compatibility](docs/COMPATIBILITY.md) — verified checks, known limits and untested areas.
+- [Test hardware](docs/TEST_HARDWARE.md) — the maintainer's machine and graphics driver.
 - [Screenshot gallery](docs/SCREENSHOTS.md) — captures, aspect comparison, and image provenance.
 - [Architecture](docs/ARCHITECTURE.md) — runtime, rendering paths, and source layout.
 - [Validation](docs/VALIDATION.md) — what has been tested for the source preview.
 - [Source provenance](docs/PROVENANCE.md) — origins of the code and compatibility data.
+- [Current priorities](docs/ROADMAP.md) — testing and development work to focus on next.
 
 ## License and credits
 

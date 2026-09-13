@@ -1,6 +1,7 @@
 name: Playtest result
 description: Report rendering, gameplay, or performance findings from your local build.
 title: "[Playtest] "
+labels: [playtest]
 body:
   - type: markdown
     attributes:
@@ -8,22 +9,22 @@ body:
   - type: input
     id: revision
     attributes:
-      label: Commit tested
-      description: Output of git rev-parse --short HEAD.
+      label: Release or commit tested
+      description: Release tag and output of git rev-parse --short HEAD, including whether you changed the source.
     validations:
       required: true
   - type: textarea
     id: system
     attributes:
       label: Hardware and settings
-      description: Windows version, CPU, GPU, driver, display aspect, render scale, and changed options.
+      description: Windows build, CPU, GPU/VRAM, RAM, driver, display resolution/refresh, aspect, render scale, guest refresh setting, and changed options.
     validations:
       required: true
   - type: textarea
     id: steps
     attributes:
       label: Scene and reproduction steps
-      description: What happened, what you expected, and how to reproduce it.
+      description: What happened, what you expected, and how to reproduce it. Successful playtests are welcome; specify exactly what you completed.
     validations:
       required: true
   - type: textarea

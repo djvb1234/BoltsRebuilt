@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/djvb1234/BoltsRebuilt/discussions
+    about: Ask general questions or discuss suggestions. Use the forms for setup failures and reproducible playtest findings.
+  - name: First playtest and troubleshooting
+    url: https://github.com/djvb1234/BoltsRebuilt/blob/main/docs/FIRST_PLAYTEST.md
+    about: Start here for the capture, shader preparation, comparison and reporting steps.
