@@ -1,4 +1,4 @@
-# Banjo-Kazooie: Nuts & Bolts — Native D3D12
+# BoltsRebuilt
 
 A static recompilation of Banjo-Kazooie: Nuts & Bolts for PC, built on RexGlue with a custom native Direct3D 12 renderer, `rexgpu-nb`.
 
