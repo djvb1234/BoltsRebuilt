@@ -4134,6 +4134,26 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   assert_true(GetPath() == Path::kHostRenderTargets);
 
   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
+  // nb: ahead of the per-frame diagnostic prologue below, which only calls with work use: its window
+  // flags are then evaluated by the first such call of a frame instead of the first call. Only the
+  // timing of its "from frame" logs and of the stencil check's report changes; they can come later,
+  // or not at all for a window in which nothing is transferred or cleared.
+  if (REXCVAR_GET(nb_native_static_bindings) && !resolve_clear_needed) {
+    bool transfers_needed = false;
+    for (uint32_t i = 0; i < render_target_count; ++i) {
+      if (render_targets[i] && !render_target_transfers[i].empty()) {
+        transfers_needed = true;
+        break;
+      }
+    }
+    if (!transfers_needed) {
+      // Match the empty-work path's scratch cleanup without acquiring raw
+      // command-list access, which invalidates native graphics root bindings.
+      current_temporary_descriptors_cpu_.clear();
+      current_temporary_descriptors_gpu_.clear();
+      return;
+    }
+  }
   // nb: diagnostic windows (the output is wrong inside them), to measure the transfers' GPU cost in one run.
   // Every window cvar here is evaluated once per frame. This function runs for every draw, and parsing a
   // window list on each call cost the command thread milliseconds per frame, more outside a window than
@@ -4178,22 +4198,6 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
                 "transfer draws used them so far)",
                 nb_stencil_coverage ? "on" : "off", NbGetCompletedSwapCount() + 1,
                 nb_stencil_coverage_transfers);
-  }
-  if (REXCVAR_GET(nb_native_static_bindings) && !resolve_clear_needed) {
-    bool transfers_needed = false;
-    for (uint32_t i = 0; i < render_target_count; ++i) {
-      if (render_targets[i] && !render_target_transfers[i].empty()) {
-        transfers_needed = true;
-        break;
-      }
-    }
-    if (!transfers_needed) {
-      // Match the empty-work path's scratch cleanup without acquiring raw
-      // command-list access, which invalidates native graphics root bindings.
-      current_temporary_descriptors_cpu_.clear();
-      current_temporary_descriptors_gpu_.clear();
-      return;
-    }
   }
 
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();

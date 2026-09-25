@@ -30,6 +30,8 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 
+#include "native/native_rt_ownership_memo.h"
+
 REXCVAR_DEFINE_BOOL(mrt_edram_used_range_clamp_to_min, true, "GPU",
                     "Clamp MRT EDRAM used range to minimum");
 
@@ -57,7 +59,21 @@ REXCVAR_DEFINE_INT32(nb_edram_transfer_log_first_tile, 1536, "nb",
 REXCVAR_DEFINE_INT32(nb_edram_transfer_log_last_tile, 2047, "nb",
                      "Last EDRAM tile of the transfer log window (inclusive)");
 
+// nb: Update skips its GetOrCreateRenderTarget and ChangeOwnership calls while the same keys claim
+// ranges no longer than the ones they already own and the ownership generation below is unchanged,
+// because those calls would then do nothing (native/native_rt_ownership_memo.h). False restores them.
+REXCVAR_DEFINE_BOOL(nb_rt_ownership_fastpath, true, "nb",
+                    "Skip re-claiming EDRAM ranges that the same render targets still own")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics {
+
+namespace {
+// nb: bumped by every call that can change ownership_ranges_ or erase from render_targets_, whatever
+// nb_rt_ownership_fastpath is, so a claim Update remembers is reused only while it still holds.
+// Command processor thread only.
+uint64_t g_nb_rt_ownership_generation = 0;
+}  // namespace
 
 void RenderTargetCache::GetPSIColorFormatInfo(xenos::ColorRenderTargetFormat format,
                                               uint32_t write_mask, float& clamp_rgb_low,
@@ -350,6 +366,7 @@ RenderTargetCache::~RenderTargetCache() {
 }
 
 void RenderTargetCache::InitializeCommon() {
+  ++g_nb_rt_ownership_generation;
   assert_true(ownership_ranges_.empty());
   ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
                             std::forward_as_tuple(xenos::kEdramTileCount, RenderTargetKey(),
@@ -357,6 +374,7 @@ void RenderTargetCache::InitializeCommon() {
 }
 
 void RenderTargetCache::DestroyAllRenderTargets(bool shutting_down) {
+  ++g_nb_rt_ownership_generation;
   ownership_ranges_.clear();
   if (!shutting_down) {
     ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
@@ -377,6 +395,7 @@ void RenderTargetCache::ShutdownCommon() {
 }
 
 void RenderTargetCache::ClearCache() {
+  ++g_nb_rt_ownership_generation;
   // Keep only render targets currently owning any EDRAM data.
   if (!render_targets_.empty()) {
     std::unordered_set<RenderTargetKey, RenderTargetKey::Hasher> used_render_targets;
@@ -637,8 +656,8 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                      << (((rts_are_64bpp >> rt_base_last.second) & 1) ^ 1));
   }
 
-  // Make sure all the needed render targets are created, and gather lengths of
-  // ranges used by each render target.
+  // Gather keys and lengths of ranges used by each render target (nb: the
+  // render targets are created below, unless the last claim still holds).
   RenderTargetKey rt_keys[1 + xenos::kMaxColorRenderTargets];
   RenderTarget* rts[1 + xenos::kMaxColorRenderTargets];
   uint32_t rt_lengths_tiles[1 + xenos::kMaxColorRenderTargets];
@@ -656,13 +675,6 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     rt_key.msaa_samples = msaa_samples;
     rt_key.is_depth = rt_bit_index == 0;
     rt_key.resource_format = resource_formats[rt_bit_index];
-    if (!interlock_barrier_only) {
-      RenderTarget* render_target = GetOrCreateRenderTarget(rt_key);
-      if (!render_target) {
-        return false;
-      }
-      rts[rt_bit_index] = render_target;
-    }
     uint32_t rt_is_64bpp = (rts_are_64bpp >> rt_bit_index) & 1;
     // The last render target can occupy the EDRAM until the base of the first
     // render target (itself in case of 1 render target) with EDRAM addressing
@@ -673,6 +685,29 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                                         ? edram_bases_sorted[i + 1].first
                                         : (xenos::kEdramTileCount + edram_bases_sorted[0].first)) -
                                        rt_base);
+  }
+
+  // nb: the same keys claiming no longer ranges with the ownership map unchanged since the last
+  // successful claim already own them, so the calls below would change nothing: take the targets
+  // from that claim instead (native/native_rt_ownership_memo.h).
+  static constinit nb::gpu::NativeRtOwnershipMemo<RenderTargetKey, RenderTarget> nb_ownership_memo;
+  const bool nb_ownership_fast_path =
+      !interlock_barrier_only && REXCVAR_GET(nb_rt_ownership_fastpath);
+  const bool nb_ownership_unchanged =
+      nb_ownership_fast_path &&
+      nb_ownership_memo.Matches(this, g_nb_rt_ownership_generation, depth_and_color_rts_used_bits,
+                                rt_keys, rt_lengths_tiles, edram_bases_sorted_count);
+  if (nb_ownership_unchanged) {
+    nb_ownership_memo.CopyTargets(rts);
+  } else if (!interlock_barrier_only) {
+    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+      uint32_t rt_bit_index = edram_bases_sorted[i].second;
+      RenderTarget* render_target = GetOrCreateRenderTarget(rt_keys[rt_bit_index]);
+      if (!render_target) {
+        return false;
+      }
+      rts[rt_bit_index] = render_target;
+    }
   }
 
   if (interlock_barrier_only) {
@@ -700,7 +735,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // draw with whatever contents currently are in the render target in this
   // case).
 
-  for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+  for (uint32_t i = 0; !nb_ownership_unchanged && i < edram_bases_sorted_count; ++i) {
     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
     uint32_t rt_bit_index = rt_base_index.second;
     ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
@@ -710,6 +745,11 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   if (interlock_barrier_only) {
     // No copying transfers or render target bindings - only needed the barrier.
     return true;
+  }
+
+  if (nb_ownership_fast_path && !nb_ownership_unchanged) {
+    nb_ownership_memo.Publish(this, g_nb_rt_ownership_generation, depth_and_color_rts_used_bits,
+                              rt_keys, rt_lengths_tiles, edram_bases_sorted_count, rts);
   }
 
   // If everything succeeded, update the used render targets.
@@ -1142,6 +1182,8 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
 }
 
 void RenderTargetCache::PixelShaderInterlockFullEdramBarrierPlaced() {
+  // nb: also reached on the host render target path, from D3D12 BeginSubmission.
+  ++g_nb_rt_ownership_generation;
   assert_true(GetPath() == Path::kPixelShaderInterlock);
   // Clear ownership - any overlap of data written before the barrier is safe.
   OwnershipRange empty_range(xenos::kEdramTileCount, RenderTargetKey(), RenderTargetKey(),
@@ -1326,6 +1368,8 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
                                         uint32_t length_tiles,
                                         std::vector<Transfer>* transfers_append_out,
                                         const Transfer::Rectangle* resolve_clear_cutout) {
+  // nb: every call, including the empty ones.
+  ++g_nb_rt_ownership_generation;
   // xenos::kEdramTileCount with length 0 is fine if both the start and the end
   // are clamped to xenos::kEdramTileCount.
   assert_true(start_tiles_base_relative <= (xenos::kEdramTileCount - uint32_t(length_tiles != 0)));
