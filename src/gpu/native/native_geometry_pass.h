@@ -132,6 +132,9 @@ class NativeGeometryPass {
     uint32_t sampler_slot_count = 0;
     uint32_t sampler_slots[kTextureSlots] = {};
     rex::graphics::d3d12::D3D12TextureCache::SamplerParameters sampler_parameters[kTextureSlots * 2];
+    // The caller proved this draw's alpha test cannot discard (native_alpha_test_variant.h): use the
+    // pixel shader without AlphaTest once its pipeline for this state is ready, the base one until then.
+    bool no_alpha_test = false;
   };
 
   // Compiles the prelude plus one shader body (thread-safe, no device needed): the slow half of
@@ -139,10 +142,12 @@ class NativeGeometryPass {
   // `interpolators`, when non-zero, defines NB_INTERPOLATORS for the compile (vertex shaders only).
   // `constants` sizes the stage's constant buffer (NB_VS_CONSTANTS / NB_PS_CONSTANTS); 0 means all 256.
   // `effective_samplers` requires SDK-resolved duplicate sampler indices and cleared sampler_sel.
+  // `alpha_test` false compiles a generated pixel shader without its AlphaTest statement (the same
+  // prelude and defines); null unless the body holds exactly one (StripNativeAlphaTest).
   static Microsoft::WRL::ComPtr<ID3DBlob> CompileShader(const char* name, const std::string& hlsl, bool vertex,
                                                         uint32_t interpolators = 0, uint32_t constants = 0,
                                                         bool effective_samplers = false,
-                                                        bool direct_guest_reads = false);
+                                                        bool direct_guest_reads = false, bool alpha_test = true);
   // Both forms declare the same registers; root_cbv changes only b0's binding.
   static Microsoft::WRL::ComPtr<ID3D12RootSignature> CreateRootSignature(ID3D12Device* device,
                                                                        bool root_cbv = false);
@@ -155,10 +160,18 @@ class NativeGeometryPass {
                   ID3D12RootSignature* root_signature, ID3D12RootSignature* root_cbv_signature = nullptr,
                   bool direct_guest_reads = false);
   bool initialized() const { return initialized_; }
+  // Adds the pixel shader without AlphaTest for draws with DrawArgs::no_alpha_test, once. Refused
+  // without a base pixel shader, or when it would break a constant-buffer proof the pass relies on.
+  bool SetNoAlphaTestPixelShader(ID3DBlob* ps);
+  bool has_no_alpha_test_pixel_shader() const { return ps_no_alpha_test_ != nullptr; }
+  // A pipeline creation with that shader failed; every draw of the pass then uses the base shader.
+  bool no_alpha_test_failed() const { return no_alpha_test_failed_; }
 
+  // `no_alpha_test_used`, when given, says whether a recorded draw used that pixel shader.
   bool Record(rex::graphics::d3d12::D3D12CommandProcessor& cp,
               const rex::graphics::d3d12::D3D12CommandProcessor::NativeDrawContext& context,
-              const GuestState& guest_state, const RootConstants& constants, const DrawArgs& args);
+              const GuestState& guest_state, const RootConstants& constants, const DrawArgs& args,
+              bool* no_alpha_test_used = nullptr);
 
   // Accumulate nanoseconds before converting to milliseconds, avoiding per-draw truncation.
   struct Timings {
@@ -234,6 +247,11 @@ class NativeGeometryPass {
   Microsoft::WRL::ComPtr<ID3D12RootSignature> root_cbv_signature_;
   Microsoft::WRL::ComPtr<ID3DBlob> vs_;
   Microsoft::WRL::ComPtr<ID3DBlob> ps_;
+  // Same body without AlphaTest (SetNoAlphaTestPixelShader); owned for the pass's life like ps_.
+  Microsoft::WRL::ComPtr<ID3DBlob> ps_no_alpha_test_;
+  bool no_alpha_test_failed_ = false;
+  // The variant (word 18) entries of pending_pipelines_, reaped or not; command processor thread only.
+  uint32_t no_alpha_test_pending_ = 0;
   NativePixelConstantReuse ps_constant_reuse_;
   NativeReadyPipelineReuse ready_pipeline_reuse_;
   static constexpr size_t kVertexConstantHeaderBytes = 688;
@@ -246,8 +264,8 @@ class NativeGeometryPass {
   bool legacy_depth_only_pixel_buffer_unused_ = false;  // original no-PS proof, unchanged
   bool empty_vertex_buffer_safe_ = false;  // both blobs have no used b1 variable beyond688
   bool empty_pixel_buffer_safe_ = false;   // both blobs have no used b2 variable beyond192
-  // Pipeline cache key: target formats and GuestState as plain words. Optional
-  // normalization removes only inputs unused by the original descriptor builder.
+  // Pipeline cache key: target formats, GuestState and the pixel shader choice as plain
+  // words. Optional normalization removes only inputs unused by the original descriptor builder.
   struct PipelineKey {
     uint32_t words[20];
     bool operator==(const PipelineKey& other) const { return std::memcmp(words, other.words, sizeof words) == 0; }
@@ -263,6 +281,21 @@ class NativeGeometryPass {
     }
   };
   std::unordered_map<PipelineKey, Microsoft::WRL::ComPtr<ID3D12PipelineState>, PipelineKeyHash> pipelines_;
+  // Words 0..17 from the draw and word 18 the pixel shader choice (0 base, 1 without AlphaTest), before
+  // any normalization.
+  static PipelineKey PipelineKeyFor(const rex::graphics::d3d12::D3D12CommandProcessor::NativeDrawContext& context,
+                                    const GuestState& state, bool root_cbv, bool no_alpha_test);
+  // One lookup of the pipeline without AlphaTest, which never creates one: the ready pipeline, or null
+  // with `absent` telling a missing key from a pending or failed one. `key` is the key it looked up.
+  ID3D12PipelineState* FindNoAlphaTestPipeline(
+      const rex::graphics::d3d12::D3D12CommandProcessor::NativeDrawContext& context,
+      const GuestState& state, bool root_cbv, PipelineKey& key, bool& absent);
+  // Queues the creation for a key known to be absent when its admission rule allows (a free base slot,
+  // or NativeNoAlphaTestPipelineAdmitted). Returns null: the pipeline is not ready yet.
+  ID3D12PipelineState* CreatePipeline(const PipelineKey& key,
+                                      const rex::graphics::d3d12::D3D12CommandProcessor::NativeDrawContext& context,
+                                      const GuestState& state, bool root_cbv, bool no_alpha_test,
+                                      bool count_request);
 
   // Bumped from workers when a creation fails, to cap the diagnostic spew. Declared before the pending
   // map on purpose: that map's destructor blocks on the workers, so anything they touch has to outlive

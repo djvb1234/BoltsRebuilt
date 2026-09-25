@@ -122,7 +122,7 @@ class NbCommandProcessor : public rex::graphics::d3d12::D3D12CommandProcessor {
   bool PrepareGeometry(const NativeDrawContext& context, NativeGeometryPass::RootConstants& root,
                        NativeGeometryPass::GuestState& state, NativeGeometryPass::DrawArgs& args,
                        const std::vector<NativeShaderLibrary::Stream>* streams);
-  void LogNativeDraw(const char* pass, const NativeDrawContext& context);
+  void LogNativeDraw(const char* pass, const NativeDrawContext& context, bool no_alpha_test = false);
   // Opens and closes a RenderDoc capture around the guest frames named by nb_rdc_frames.
   void UpdateRenderDocCapture(uint64_t frame);
 
@@ -186,6 +186,12 @@ class NbCommandProcessor : public rex::graphics::d3d12::D3D12CommandProcessor {
   uint64_t native_stacked_texture_draws_ = 0;
   uint64_t native_cube_texture_draws_ = 0;
   uint64_t native_extra_stream_draws_ = 0;
+  // Generic draws that selected the pixel shader without alpha test (nb_native_alpha_test_variant):
+  // drawn with it, with the base shader while it or its pipeline was not ready, or with it unavailable
+  // (sidecar-eligible, but its compile or a pipeline with it failed, or the pass refused it).
+  uint64_t native_no_alpha_test_draws_ = 0;
+  uint64_t native_no_alpha_test_pending_ = 0;
+  uint64_t native_no_alpha_test_unavailable_ = 0;
 
   // Window key events only enqueue toggle parity; cvars change on the CP thread
   // at a swap boundary, even when a complete key tap falls between two swaps.

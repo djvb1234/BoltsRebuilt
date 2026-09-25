@@ -22,6 +22,7 @@
 #include <rex/logging.h>
 
 #include "native_prelude.h"
+#include "native_alpha_test_variant.h"
 #include "native_asset_cache.h"
 #include "native_gpu_upload_pool.h"
 #include "native_constant_upload_diagnostics.h"
@@ -362,6 +363,10 @@ NativeGeometryPass::Timings g_timings;
 NativeGeometryPass::ConstantReuseStats g_constant_reuse_stats;
 NativeGeometryPass::IndexDrawStats g_index_draw_stats;
 NativeGeometryPass::PipelineKeyStats g_pipeline_key_stats;
+// No-alpha-test pipeline creations in flight across all passes (NativeNoAlphaTestPipelineAdmitted):
+// counted from queueing on the command processor thread until CreateGraphicsPipelineState returns on
+// the worker. Not until the pass reaps the result: a pass that is never drawn again never reaps.
+std::atomic<uint32_t> g_no_alpha_test_pipelines_in_flight{0};
 
 }  // namespace
 
@@ -407,8 +412,18 @@ uint8_t* RequestConstantSlice(rex::graphics::d3d12::D3D12CommandProcessor& cp,
 Microsoft::WRL::ComPtr<ID3DBlob> NativeGeometryPass::CompileShader(const char* name, const std::string& hlsl,
                                                                    bool vertex, uint32_t interpolators,
                                                                    uint32_t constants, bool effective_samplers,
-                                                                   bool direct_guest_reads) {
-  const std::string source = std::string(kNativePreludeHlsl) + hlsl;
+                                                                   bool direct_guest_reads, bool alpha_test) {
+  // The prelude stays untouched, so the generated form's source, defines and shader-cache key are
+  // unchanged; the form without AlphaTest differs only in its body, and so has its own key.
+  std::string body;
+  if (!alpha_test) {
+    body = hlsl;
+    if (vertex || !StripNativeAlphaTest(body)) {
+      REXLOG_WARN("rexgpu-nb: geometry pass '{}': no single AlphaTest statement; generated pixel shader kept", name);
+      return nullptr;
+    }
+  }
+  const std::string source = std::string(kNativePreludeHlsl) + (alpha_test ? hlsl : body);
   const std::string interpolator_count = std::to_string(interpolators);
   // A shader that reads no constants still needs one register: HLSL has no zero-length array.
   const std::string constant_count = std::to_string(constants ? std::max<uint32_t>(1, constants) : 256);
@@ -448,6 +463,8 @@ bool NativeGeometryPass::Initialize(ID3D12Device* device, const char* name, ID3D
   device_ = device;
   vs_ = vs;
   ps_ = ps;  // null for a depth-only pass (the guest bound no pixel shader)
+  ps_no_alpha_test_.Reset();
+  no_alpha_test_failed_ = false;
   direct_guest_reads_ = direct_guest_reads;
   vertex_packet_diagnostics_.Reset();
   vertex_constant_reuse_.Reset();
@@ -496,6 +513,24 @@ bool NativeGeometryPass::Initialize(ID3D12Device* device, const char* name, ID3D
   initialized_ = true;
   REXLOG_INFO("rexgpu-nb: geometry pass '{}' ready (vs {} B, ps {} B)", name, vs_->GetBufferSize(),
               ps_ ? ps_->GetBufferSize() : 0);
+  return true;
+}
+
+bool NativeGeometryPass::SetNoAlphaTestPixelShader(ID3DBlob* ps) {
+  if (!initialized_ || !ps_ || !ps || ps_no_alpha_test_) {
+    return false;
+  }
+  // Both pixel shaders share this pass's constant packets. The variant's body is a subset of the base
+  // one, so its reflection should prove at least as much; refuse it rather than weaken any proof.
+  if ((empty_vertex_buffer_safe_ && !ShaderConstantHeaderOnly(ps, 1, uint32_t(kVertexConstantHeaderBytes))) ||
+      (empty_pixel_buffer_safe_ &&
+       !ShaderConstantHeaderOnly(ps, 2, uint32_t(NativePixelConstantPacket::kHeaderBytes))) ||
+      (pixel_buffer_unused_ && !ShaderConstantHeaderOnly(ps, 2, 0))) {
+    REXLOG_WARN("rexgpu-nb: geometry pass '{}': pixel shader without AlphaTest refused (constant buffer use differs)",
+                name_);
+    return false;
+  }
+  ps_no_alpha_test_ = ps;
   return true;
 }
 
@@ -582,8 +617,9 @@ Microsoft::WRL::ComPtr<ID3D12RootSignature> NativeGeometryPass::CreateRootSignat
   return root_signature;
 }
 
-ID3D12PipelineState* NativeGeometryPass::GetPipeline(const D3D12CommandProcessor::NativeDrawContext& context,
-                                                     const GuestState& state, bool root_cbv) {
+NativeGeometryPass::PipelineKey NativeGeometryPass::PipelineKeyFor(
+    const D3D12CommandProcessor::NativeDrawContext& context, const GuestState& state, bool root_cbv,
+    bool no_alpha_test) {
   PipelineKey key = {};
   uint32_t* w = key.words;
   for (uint32_t i = 0; i < 4; ++i) w[i] = uint32_t(context.rtv_formats[i]);
@@ -598,6 +634,15 @@ ID3D12PipelineState* NativeGeometryPass::GetPipeline(const D3D12CommandProcessor
   std::memcpy(&w[15], &state.depth_bias_slope, sizeof(float));
   w[16] = (state.depth_clip ? 1u : 0u) | (state.alpha_to_mask ? 2u : 0u) | (root_cbv ? 4u : 0u);
   w[17] = context.sample_mask;
+  // Which pixel shader the pipeline is built with. Part of the key before any lookup, so a draw whose
+  // alpha test can discard never finds a pipeline without AlphaTest.
+  w[18] = no_alpha_test ? 1u : 0u;
+  return key;
+}
+
+ID3D12PipelineState* NativeGeometryPass::GetPipeline(const D3D12CommandProcessor::NativeDrawContext& context,
+                                                     const GuestState& state, bool root_cbv) {
+  PipelineKey key = PipelineKeyFor(context, state, root_cbv, false);
   const bool normalize_key = REXCVAR_GET(nb_native_pipeline_key_normalize);
   if (normalize_key) {
     static_assert(DXGI_FORMAT_UNKNOWN == 0);
@@ -637,14 +682,67 @@ ID3D12PipelineState* NativeGeometryPass::GetPipeline(const D3D12CommandProcessor
     if (normalize_key) ++g_pipeline_key_stats.pending_hits;
     return nullptr;  // already being built; this draw stays emulated
   }
+  return CreatePipeline(key, context, state, root_cbv, false, normalize_key);
+}
+
+ID3D12PipelineState* NativeGeometryPass::FindNoAlphaTestPipeline(
+    const D3D12CommandProcessor::NativeDrawContext& context, const GuestState& state, bool root_cbv,
+    PipelineKey& key, bool& absent) {
+  absent = false;
+  key = PipelineKeyFor(context, state, root_cbv, true);
+  const bool normalize_key = REXCVAR_GET(nb_native_pipeline_key_normalize);
+  const bool key_changed = normalize_key && NormalizeNativePipelineKey(key.words);
+  if (!pending_pipelines_.empty()) {
+    ReapPipelines();
+  }
+  // Only an answer the draw uses counts, as its one lookup in the per-lookup diagnostics: a probe that
+  // falls back to the base pipeline counts nothing, and the base lookup then counts as before.
+  const auto answer = [&](ID3D12PipelineState* pipeline, bool memo_hit) {
+    if (normalize_key) {
+      ++g_pipeline_key_stats.normalized_lookups;
+      g_pipeline_key_stats.changed_key_draws += key_changed;
+      ++(memo_hit ? g_pipeline_key_stats.ready_memo_hits : g_pipeline_key_stats.ready_map_hits);
+    }
+    return pipeline;
+  };
+  const bool reuse = REXCVAR_GET(nb_native_constant_reuse);
+  if (reuse) {
+    if (const uintptr_t previous = ready_pipeline_reuse_.Find(key.words)) {
+      ++g_constant_reuse_stats.pipeline_hits;
+      return answer(reinterpret_cast<ID3D12PipelineState*>(previous), true);
+    }
+  }
+  auto it = pipelines_.find(key);
+  if (it != pipelines_.end()) {
+    // Null: the creation failed, and ReapPipelines has already disabled the variant in this pass.
+    if (!it->second) {
+      return nullptr;
+    }
+    if (reuse) {
+      ++g_constant_reuse_stats.pipeline_misses;
+      ready_pipeline_reuse_.Publish(key.words, reinterpret_cast<uintptr_t>(it->second.Get()));
+    }
+    return answer(it->second.Get(), false);
+  }
+  absent = pending_pipelines_.find(key) == pending_pipelines_.end();
+  return nullptr;
+}
+
+ID3D12PipelineState* NativeGeometryPass::CreatePipeline(const PipelineKey& key,
+                                                        const D3D12CommandProcessor::NativeDrawContext& context,
+                                                        const GuestState& state, bool root_cbv,
+                                                        bool no_alpha_test, bool count_request) {
+  if (no_alpha_test && !ps_no_alpha_test_) {
+    return nullptr;
+  }
   char key_text[224];
-  std::snprintf(key_text, sizeof key_text, "%d,%d,%d,%d|%d|%u|%08X,%08X,%08X,%08X|%08X|%08X|%08X|%08X|%d,%g,%d,%d|root_cbv=%d",
+  std::snprintf(key_text, sizeof key_text, "%d,%d,%d,%d|%d|%u|%08X,%08X,%08X,%08X|%08X|%08X|%08X|%08X|%d,%g,%d,%d|root_cbv=%d%s",
                 int(context.rtv_formats[0]), int(context.rtv_formats[1]), int(context.rtv_formats[2]),
                 int(context.rtv_formats[3]), int(context.dsv_format), context.sample_count, state.blendcontrol[0],
                 state.blendcontrol[1], state.blendcontrol[2], state.blendcontrol[3], state.depthcontrol,
                 state.su_mode_cntl, state.color_mask, state.stencil_ref_mask, state.depth_bias,
                 double(state.depth_bias_slope), state.depth_clip ? 1 : 0, state.alpha_to_mask ? 1 : 0,
-                root_cbv ? 1 : 0);
+                root_cbv ? 1 : 0, no_alpha_test ? "|no_alpha_test" : "");
 
   rex::graphics::reg::RB_DEPTHCONTROL depth;
   depth.value = state.depthcontrol;
@@ -654,8 +752,8 @@ ID3D12PipelineState* NativeGeometryPass::GetPipeline(const D3D12CommandProcessor
   D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
   desc.pRootSignature = root_cbv ? root_cbv_signature_.Get() : root_signature_.Get();
   desc.VS = {vs_->GetBufferPointer(), vs_->GetBufferSize()};
-  if (ps_) {
-    desc.PS = {ps_->GetBufferPointer(), ps_->GetBufferSize()};
+  if (ID3DBlob* ps = no_alpha_test ? ps_no_alpha_test_.Get() : ps_.Get()) {
+    desc.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
   }
   desc.BlendState.IndependentBlendEnable = TRUE;
   // Alpha to coverage on MSAA targets, as the guest's RB_COLORCONTROL asks (the SDK does the same).
@@ -756,16 +854,24 @@ ID3D12PipelineState* NativeGeometryPass::GetPipeline(const D3D12CommandProcessor
   // Everything the driver needs is by value in `desc` now, bar the root signature and the two shader
   // blobs, which this object owns for its whole life. Hand it to a worker: at about 300 ms apiece these
   // cost more than a frame each, and doing them here froze a play session for half its length.
-  if (pending_pipelines_.size() >= MaxPipelinesInFlight()) {
-    return nullptr;  // stays emulated until a slot frees up
+  // Pending variant creations never take one of the base slots (native_alpha_test_variant.h).
+  if (no_alpha_test
+          ? !NativeNoAlphaTestPipelineAdmitted(pending_pipelines_.size(),
+                                               g_no_alpha_test_pipelines_in_flight.load(std::memory_order_relaxed))
+          : !NativeBaseSlotFree(pending_pipelines_.size(), no_alpha_test_pending_, MaxPipelinesInFlight())) {
+    return nullptr;  // a base draw stays emulated until a slot frees up; a variant keeps the base pipeline
   }
   const bool cull_front = su.cull_front != 0;
   const bool cull_back = su.cull_back != 0;
+  // Counted before the worker can finish; the worker uncounts itself whatever the result, so passes
+  // destroyed with creations pending (their futures join the workers) leave the count exact.
+  if (no_alpha_test) g_no_alpha_test_pipelines_in_flight.fetch_add(1, std::memory_order_relaxed);
   pending_pipelines_.emplace(
       key, std::async(std::launch::async, [this, desc, key_string = std::string(key_text), any_blend,
-                                           cull_front, cull_back]() {
+                                           cull_front, cull_back, no_alpha_test]() {
         Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;
         const HRESULT pso_hr = device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
+        if (no_alpha_test) g_no_alpha_test_pipelines_in_flight.fetch_sub(1, std::memory_order_relaxed);
         if (FAILED(pso_hr)) {
           if (failures_.fetch_add(1, std::memory_order_relaxed) < 8) {
             REXLOG_ERROR("rexgpu-nb: geometry pass '{}': pipeline creation failed (0x{:08X}) for key {}",
@@ -822,7 +928,8 @@ ID3D12PipelineState* NativeGeometryPass::GetPipeline(const D3D12CommandProcessor
                     any_blend ? "on" : "off", cull_front ? "front" : cull_back ? "back" : "none");
         return pipeline;
       }));
-  if (normalize_key) ++g_pipeline_key_stats.create_requests;
+  no_alpha_test_pending_ += no_alpha_test ? 1 : 0;
+  if (count_request) ++g_pipeline_key_stats.create_requests;
   return nullptr;
 }
 
@@ -839,13 +946,21 @@ void NativeGeometryPass::ReapPipelines() {
       ++it;
       continue;
     }
-    pipelines_.emplace(it->first, it->second.get());
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline = it->second.get();
+    if (it->first.words[18]) {
+      --no_alpha_test_pending_;
+      // A failed variant creation disables the variant for the whole pass, so later draws skip its
+      // lookup entirely and draw with the base pipeline.
+      if (!pipeline) no_alpha_test_failed_ = true;
+    }
+    pipelines_.emplace(it->first, std::move(pipeline));
     it = pending_pipelines_.erase(it);
   }
 }
 
 bool NativeGeometryPass::Record(D3D12CommandProcessor& cp, const D3D12CommandProcessor::NativeDrawContext& context,
-                                const GuestState& guest_state, const RootConstants& constants, const DrawArgs& args) {
+                                const GuestState& guest_state, const RootConstants& constants, const DrawArgs& args,
+                                bool* no_alpha_test_used) {
   const bool observe_vertex_packet = REXCVAR_GET(nb_native_vertex_packet_diagnostics);
   const bool vertex_packet_eligible = args.asset_cache == nullptr;
   const bool vertex_reuse_requested = REXCVAR_GET(nb_native_vertex_constant_reuse);
@@ -887,7 +1002,27 @@ bool NativeGeometryPass::Record(D3D12CommandProcessor& cp, const D3D12CommandPro
     return false;
   }
   auto stage_start = NativeTimingStart(detailed);
-  ID3D12PipelineState* pipeline = GetPipeline(context, guest_state, root_cbv);
+  // A draw asking for the pixel shader without AlphaTest makes one lookup for its pipeline, which never
+  // creates anything. Unless that pipeline is ready the draw takes the base pipeline exactly as with the
+  // variant disabled. An absent one is queued only behind a ready base pipeline and only when the pass
+  // has no creation in flight; it never takes a base slot, so no draw is refused for one it holds.
+  const bool want_no_alpha_test = args.no_alpha_test && ps_no_alpha_test_ && !no_alpha_test_failed_;
+  PipelineKey no_alpha_test_key;
+  bool no_alpha_test_absent = false;
+  ID3D12PipelineState* pipeline =
+      want_no_alpha_test
+          ? FindNoAlphaTestPipeline(context, guest_state, root_cbv, no_alpha_test_key, no_alpha_test_absent)
+          : nullptr;
+  const bool no_alpha_test = pipeline != nullptr;
+  if (!pipeline) {
+    pipeline = GetPipeline(context, guest_state, root_cbv);
+    // The base lookup reaps too; a variant creation it finds failed has just disabled the variant.
+    if (pipeline && no_alpha_test_absent && !no_alpha_test_failed_ &&
+        NativeNoAlphaTestPipelineAdmitted(pending_pipelines_.size(),
+                                          g_no_alpha_test_pipelines_in_flight.load(std::memory_order_relaxed))) {
+      CreatePipeline(no_alpha_test_key, context, guest_state, root_cbv, true, false);
+    }
+  }
   g_timings.pipeline_ns += NativeTimingElapsed(detailed, stage_start);
   if (!pipeline) {
     return false;
@@ -1325,6 +1460,7 @@ bool NativeGeometryPass::Record(D3D12CommandProcessor& cp, const D3D12CommandPro
                   REXCVAR_GET(nb_native_vertex_range_census_last), REXCVAR_GET(nb_native_vertex_range_census_period),
                   name_, shared_memory, constants, args);
   }
+  if (no_alpha_test_used) *no_alpha_test_used = no_alpha_test;
   return true;
 }
 

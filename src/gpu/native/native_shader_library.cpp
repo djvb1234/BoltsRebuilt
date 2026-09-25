@@ -1,6 +1,7 @@
 // See native_shader_library.h.
 
 #include "native_shader_library.h"
+#include "native_alpha_test_variant.h"
 #include "native_constant_layout.h"
 
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <sstream>
 #include <thread>
 
@@ -60,10 +62,15 @@ bool MatchesAny(const std::string& stem, const std::vector<std::string>& needles
   return false;
 }
 
-// Background compiles at once; shaders past the cap wait and their draws stay emulated meanwhile.
+// Background compiles at once; shaders past the cap wait and their draws stay emulated meanwhile. One
+// more may run beside them: a pixel shader's form without AlphaTest, which never takes one of these slots
+// (native_alpha_test_variant.h). Computed once: a draw waiting for that slot asks on every draw.
 uint32_t MaxCompilesInFlight() {
-  const uint32_t threads = std::thread::hardware_concurrency();
-  return threads > 4 ? threads / 2 : 2;
+  static const uint32_t max_compiles = [] {
+    const uint32_t threads = std::thread::hardware_concurrency();
+    return threads > 4 ? threads / 2 : 2;
+  }();
+  return max_compiles;
 }
 
 std::string HexHash(uint64_t hash) {
@@ -91,12 +98,14 @@ bool NativeShaderLibrary::ParseMeta(const std::string& path, StageShader& shader
   bool have_hash = false;
   bool have_texture_dimensions = false;
   NativeConstantLayoutMetadata<NativeGeometryPass::ConstantRun> constant_layout;
+  NativeAlphaTestVariantSidecar alpha_test_variant;
   while (std::getline(lines, line)) {
     const size_t eq = line.find('=');
     if (line.empty() || line[0] == '#' || eq == std::string::npos) continue;
     const std::string key = line.substr(0, eq);
     std::string value = line.substr(eq + 1);
     if (!value.empty() && value.back() == '\r') value.pop_back();
+    alpha_test_variant.Observe(key, value);
     if (key == "hash") {
       shader.hash = std::strtoull(value.c_str(), nullptr, 16);
       have_hash = true;
@@ -137,6 +146,7 @@ bool NativeShaderLibrary::ParseMeta(const std::string& path, StageShader& shader
   shader.has_packed_layout = constant_layout.has_packed_layout;
   shader.packed_constants = constant_layout.packed_registers;
   shader.constant_runs = std::move(constant_layout.runs);
+  shader.no_alpha_test_eligible = !shader.vertex && alpha_test_variant.eligible();
   // Sidecars generated before dimensional texture bindings described only 2D instructions.
   if (!have_texture_dimensions) {
     shader.texture_dimensions.assign(shader.texture_fetch_constants.size(), 2u);
@@ -163,6 +173,7 @@ size_t NativeShaderLibrary::Load(const std::string& directory, const std::string
   shaders_.clear();
   pairs_.clear();
   compiling_.clear();
+  no_alpha_test_compiling_ = 0;
   filters_ = Split(filter, ',');
   excludes_ = Split(exclude, ',');
   vertex_shaders_ = pixel_shaders_ = 0;
@@ -215,7 +226,9 @@ void NativeShaderLibrary::ReapCompiles() {
       continue;
     }
     try {
-      variant->blob = variant->compile.get();
+      Compiled compiled = variant->compile.get();
+      variant->blob = std::move(compiled.blob);
+      variant->source_hash = compiled.source_hash;
     } catch (const std::exception& error) {
       REXLOG_WARN("rexgpu-nb: native shader library: background source read/compile failed: {}", error.what());
       variant->blob.Reset();
@@ -224,20 +237,38 @@ void NativeShaderLibrary::ReapCompiles() {
       variant->blob.Reset();
     }
     variant->state = variant->blob ? State::kReady : State::kFailed;
+    if (variant->no_alpha_test) --no_alpha_test_compiling_;
     compiling_[i] = compiling_.back();
     compiling_.pop_back();
   }
 }
 
 NativeShaderLibrary::Variant* NativeShaderLibrary::EnsureCompiled(StageShader& shader,
-                                                                  uint32_t interpolators) {
-  const uint32_t key = shader.vertex ? interpolators : 0;
+                                                                  uint32_t interpolators, bool alpha_test) {
+  const uint32_t key = shader.vertex ? interpolators : (alpha_test ? 0 : kNoAlphaTestKey);
   auto it = shader.variants.find(key);
   if (it == shader.variants.end()) {
     const uint32_t max_compiles = MaxCompilesInFlight();
-    if (compiling_.size() >= max_compiles) {
+    // A form without AlphaTest is optional (its draws already have the generated form), so it never
+    // takes one of the cap's slots: at most one runs beside them, started only while first-use
+    // compiles are below the cap.
+    if (!alpha_test) {
+      if (!NativeNoAlphaTestCompileAdmitted(compiling_.size(), no_alpha_test_compiling_, max_compiles)) {
+        return nullptr;  // the draw keeps the generated form meanwhile
+      }
+    } else if (!NativeBaseSlotFree(compiling_.size(), no_alpha_test_compiling_, max_compiles)) {
       return nullptr;  // stays emulated until a compile slot frees up
     }
+    // The form without AlphaTest must be built from the same body as the generated form this pass
+    // already draws with; a library regenerated mid-run leaves it unavailable instead.
+    size_t expected_hash = 0;
+    if (!alpha_test) {
+      const auto base = shader.variants.find(0);
+      if (base != shader.variants.end() && base->second->state == State::kReady) {
+        expected_hash = base->second->source_hash;
+      }
+    }
+    const bool hash_source = !shader.vertex && alpha_test && shader.no_alpha_test_eligible;
     const bool async_reads = REXCVAR_GET(nb_native_async_shader_reads);
     std::string source_path = (std::filesystem::path(directory_) / (shader.stem + ".hlsl")).string();
     std::string hlsl;
@@ -250,26 +281,38 @@ NativeShaderLibrary::Variant* NativeShaderLibrary::EnsureCompiled(StageShader& s
       return result;
     }
     auto variant = std::make_unique<Variant>();
+    variant->no_alpha_test = !alpha_test;
     const bool vertex = shader.vertex;
+    const uint32_t compile_interpolators = vertex ? interpolators : 0;
     const uint32_t packed = shader.packed_constants;
     const bool effective_samplers = effective_samplers_;
     const bool direct_guest_reads = direct_guest_reads_;
     // Allocate tracking storage before starting work, and publish ownership
     // before its raw pointer. A failed map allocation must not leave a dangling
     // entry for ReapCompiles; the local future still joins its job on unwinding.
-    compiling_.reserve(max_compiles);
+    compiling_.reserve(max_compiles + 1);
     variant->compile =
-        std::async(std::launch::async, [name = shader.stem, path = std::move(source_path), source = std::move(hlsl), vertex, key, packed, effective_samplers, direct_guest_reads, async_reads]() mutable {
+        std::async(std::launch::async, [name = alpha_test ? shader.stem : shader.stem + "_noalphatest", path = std::move(source_path), source = std::move(hlsl), vertex, compile_interpolators, packed, effective_samplers, direct_guest_reads, async_reads, alpha_test, hash_source, expected_hash]() mutable {
           if (async_reads && !ReadFile(path, source)) {
             REXLOG_WARN("rexgpu-nb: native shader library: {}: source missing next to the sidecar", name);
-            return Microsoft::WRL::ComPtr<ID3DBlob>{};
+            return Compiled{};
           }
-          return NativeGeometryPass::CompileShader(name.c_str(), source, vertex, key, packed, effective_samplers, direct_guest_reads);
+          Compiled compiled;
+          if (hash_source || !alpha_test) {
+            compiled.source_hash = std::hash<std::string>{}(source);
+          }
+          if (!alpha_test && (expected_hash == 0 || compiled.source_hash != expected_hash)) {
+            REXLOG_WARN("rexgpu-nb: native shader library: {}: source differs from the generated form's; not compiled", name);
+            return Compiled{};
+          }
+          compiled.blob = NativeGeometryPass::CompileShader(name.c_str(), source, vertex, compile_interpolators, packed, effective_samplers, direct_guest_reads, alpha_test);
+          return compiled;
         });
     variant->state = State::kCompiling;
     Variant* result = variant.get();
     shader.variants[key] = std::move(variant);
     compiling_.push_back(result);
+    no_alpha_test_compiling_ += alpha_test ? 0 : 1;
     return result;
   }
   return it->second.get();
@@ -364,6 +407,44 @@ NativeShaderLibrary::Lookup NativeShaderLibrary::FindPair(uint64_t vs_hash, uint
   *pair_out = result;
   if (memo_enabled) ready_pair_memo_.Publish(vs_hash, ps_hash, result);
   return Lookup::kReady;
+}
+
+NativeShaderLibrary::VariantStatus NativeShaderLibrary::RequestNoAlphaTest(Pair& pair) {
+  if (pair.pass.has_no_alpha_test_pixel_shader()) {
+    return pair.pass.no_alpha_test_failed() ? VariantStatus::kUnavailable : VariantStatus::kReady;
+  }
+  if (!pair.ps || !pair.ps->no_alpha_test_eligible || pair.no_alpha_test_refused) {
+    return VariantStatus::kUnavailable;
+  }
+  // Pairs built before the compile finished (or before any draw asked) pick it up here, whichever
+  // FindPair path returned them. The Variant pointer stays valid for the library's lifetime.
+  if (!pair.no_alpha_test) {
+    // Another pair with this pixel shader may have started or finished its form already: adopt it.
+    // Only a new compile waits for the one variant compile slot, the common case during warm-up, and
+    // that wait is answered before the shaders_ lookup a start needs.
+    const auto existing = pair.ps->variants.find(kNoAlphaTestKey);
+    if (existing != pair.ps->variants.end()) {
+      pair.no_alpha_test = existing->second.get();
+    } else if (!NativeNoAlphaTestCompileAdmitted(compiling_.size(), no_alpha_test_compiling_,
+                                                 MaxCompilesInFlight())) {
+      return VariantStatus::kPending;
+    } else {
+      StageShader* ps = Find(pair.ps->hash, false);  // pair.ps itself, as the library's mutable entry
+      pair.no_alpha_test = ps ? EnsureCompiled(*ps, 0, false) : nullptr;
+      if (!pair.no_alpha_test) {
+        return VariantStatus::kPending;
+      }
+    }
+  }
+  if (pair.no_alpha_test->state == State::kCompiling) {
+    return VariantStatus::kPending;
+  }
+  if (pair.no_alpha_test->state == State::kReady &&
+      pair.pass.SetNoAlphaTestPixelShader(pair.no_alpha_test->blob.Get())) {
+    return VariantStatus::kReady;
+  }
+  pair.no_alpha_test_refused = true;
+  return VariantStatus::kUnavailable;
 }
 
 }  // namespace nb::gpu

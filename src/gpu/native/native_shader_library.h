@@ -34,13 +34,24 @@ class NativeShaderLibrary {
   };
   enum class State { kIdle, kCompiling, kReady, kFailed };
 
+  // What a background compile hands back: the blob, and for a pixel shader eligible for the form
+  // without AlphaTest, std::hash of the body it compiled, which that form must be built from too.
+  struct Compiled {
+    Microsoft::WRL::ComPtr<ID3DBlob> blob;
+    size_t source_hash = 0;  // 0: not recorded
+  };
   // One compiled form of a shader. A vertex shader has one per interpolator count a pair asks for
-  // (almost always one); a pixel shader has a single form.
+  // (almost always one); a pixel shader has its generated form and, on request, the form without its
+  // alpha-test discard (native_alpha_test_variant.h).
   struct Variant {
     State state = State::kIdle;
-    std::future<Microsoft::WRL::ComPtr<ID3DBlob>> compile;
+    std::future<Compiled> compile;
     Microsoft::WRL::ComPtr<ID3DBlob> blob;
+    size_t source_hash = 0;      // Compiled::source_hash
+    bool no_alpha_test = false;  // compiles beside the first-use cap (EnsureCompiled)
   };
+  // The pixel-shader variant key of the form without AlphaTest; the generated form keeps key 0.
+  static constexpr uint32_t kNoAlphaTestKey = 1;
 
   // One translated guest shader.
   struct StageShader {
@@ -60,7 +71,11 @@ class NativeShaderLibrary {
     uint32_t packed_constants = 0;
     bool has_packed_layout = false;  // cruns was present; empty means no guest float reads
     bool writes_depth = false;                      // pixel shaders only
-    std::unordered_map<uint32_t, std::unique_ptr<Variant>> variants;  // by interpolator count (pixel: 0)
+    // Pixel shaders only: the sidecar says kills=0 and writes_depth=0, so dropping the alpha-test
+    // discard leaves a shader the driver can run after an early depth/stencil test.
+    bool no_alpha_test_eligible = false;
+    // By interpolator count (vertex), or 0 / kNoAlphaTestKey (pixel).
+    std::unordered_map<uint32_t, std::unique_ptr<Variant>> variants;
   };
 
   // One (vertex, pixel) combination actually drawn, with its own pipeline cache.
@@ -72,6 +87,10 @@ class NativeShaderLibrary {
     NativeGeometryPass pass;
     uint32_t draws = 0;
     uint32_t skips = 0;
+    // The pixel shader without AlphaTest, requested by the first draw that selects it and added to
+    // `pass` once compiled (RequestNoAlphaTest). Failing it disables only this form, never the pair.
+    Variant* no_alpha_test = nullptr;
+    bool no_alpha_test_refused = false;
   };
 
   // Reads every .meta in `directory`. `filter` (comma-separated substrings of "<vs>_<ps>", empty = all)
@@ -83,6 +102,12 @@ class NativeShaderLibrary {
   // Finds (and on first use builds) the pass for this shader pair. `pair_out` is set only for kReady.
   Lookup FindPair(uint64_t vs_hash, uint64_t ps_hash, ID3D12Device* device, Pair** pair_out);
 
+  enum class VariantStatus { kReady, kPending, kUnavailable };
+  // For a draw that selected the pixel shader without AlphaTest (nb_native_alpha_test_variant): adds
+  // it to the pair's pass once compiled, starting that compile on first use. kPending and kUnavailable
+  // leave the draw on the pair's generated pixel shader; neither changes the pair's usability.
+  VariantStatus RequestNoAlphaTest(Pair& pair);
+
   size_t shader_count() const { return shaders_.size(); }
   const std::string& directory() const { return directory_; }
   const NativeReadyPairMemoStats& pair_lookup_memo_stats() const {
@@ -93,8 +118,9 @@ class NativeShaderLibrary {
   StageShader* Find(uint64_t hash, bool vertex);
   bool ParseMeta(const std::string& path, StageShader& shader) const;
   // Starts the background compile if a slot is free, and finishes any that are done. `interpolators` is
-  // the count a vertex shader must declare for the pair being built.
-  Variant* EnsureCompiled(StageShader& shader, uint32_t interpolators);
+  // the count a vertex shader must declare for the pair being built; `alpha_test` false asks for a pixel
+  // shader's form without AlphaTest, which runs beside the cap and never takes a first-use slot.
+  Variant* EnsureCompiled(StageShader& shader, uint32_t interpolators, bool alpha_test = true);
   void ReapCompiles();
   bool PairEnabled(const std::string& stem) const;
 
@@ -105,6 +131,7 @@ class NativeShaderLibrary {
   std::unordered_map<uint64_t, std::unique_ptr<StageShader>> shaders_;
   std::unordered_map<uint64_t, std::unique_ptr<Pair>> pairs_;
   std::vector<Variant*> compiling_;
+  uint32_t no_alpha_test_compiling_ = 0;  // the no_alpha_test entries of compiling_
   std::vector<std::string> filters_;
   std::vector<std::string> excludes_;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> root_signature_;

@@ -199,5 +199,75 @@ class VertexStreamTests(unittest.TestCase):
                     translator.stream_slot(fetch, stride)
 
 
+class AlphaTestVariantTests(unittest.TestCase):
+    """What the native pixel shader without AlphaTest (src/gpu/native/native_alpha_test_variant.h)
+    relies on in the generated library and the prelude."""
+
+    PIXEL_LISTINGS = {
+        "add oC0, c0, c1": ("0", "0"),
+        "add oC1, c0, c1": ("0", "0"),
+        "add oC0, c0, c1\nadd oC1, c0, c1": ("0", "0"),
+        "kills_eq r0.x, c0.x\nadd oC0, c0, c1": ("1", "0"),
+        "kill_eq r0, c0, c1\nadd oC0, c0, c1": ("1", "0"),
+        "add oC0, c0, c1\nmax oDepth, c2, c2": ("0", "1"),
+    }
+
+    @staticmethod
+    def sidecar(meta):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "synthetic.meta"
+            ucode2hlsl.write_sidecar(path, "0000000000000001", meta)
+            return dict(line.split("=", 1) for line in path.read_text().splitlines())
+
+    def test_pixel_shaders_end_with_one_standalone_alpha_test(self):
+        for listing in self.PIXEL_LISTINGS:
+            with self.subTest(listing=listing):
+                hlsl, _ = ucode2hlsl.translate_ps(listing)
+                self.assertEqual(hlsl.count("AlphaTest(oC0.w);"), 1)
+                self.assertIn("\n  AlphaTest(oC0.w);\n", hlsl)
+
+    def test_pixel_sidecars_state_kills_and_depth_writes(self):
+        for listing, (kills, writes_depth) in self.PIXEL_LISTINGS.items():
+            with self.subTest(listing=listing):
+                hlsl, meta = ucode2hlsl.translate_ps(listing)
+                sidecar = self.sidecar(meta)
+                self.assertEqual(sidecar["kills"], kills)
+                self.assertEqual(sidecar["writes_depth"], writes_depth)
+                # AlphaTest's discard lives in the prelude; a body discards only for a guest kill.
+                self.assertEqual("discard" in hlsl, kills == "1")
+                self.assertEqual("SV_Depth" in hlsl, writes_depth == "1")
+                self.assertNotIn("SV_Coverage", hlsl)
+
+    def test_vertex_sidecars_use_a_different_kill_key(self):
+        _, meta = ucode2hlsl.translate_vs("add oPos, c0, c1")
+        sidecar = self.sidecar(meta)
+        self.assertEqual(sidecar["kill"], "0")
+        self.assertNotIn("kills", sidecar)
+        self.assertNotIn("writes_depth", sidecar)
+
+    def test_prelude_alpha_test_is_the_transcribed_function(self):
+        # tools/test_native_alpha_test_variant.cpp checks NativeAlphaTestCanDiscard against a copy of
+        # this function; a change here must be carried there. It is the prelude's only discard, and the
+        # prelude declares no writable resource.
+        with open(ucode2hlsl.PRELUDE, encoding="utf-8") as f:
+            prelude = f.read()
+        self.assertEqual(prelude.count(
+            "void AlphaTest(float a) {\n"
+            "  if ((alpha_test.x & 8u) == 0u) return;\n"
+            "  float ref_value = asfloat(alpha_test.y);\n"
+            "  uint f = alpha_test.x & 7u;\n"
+            "  // (\"pass\" is an HLSL keyword.)\n"
+            "  bool keep = (f == 1u) ? (a < ref_value) : (f == 2u) ? (a == ref_value) : "
+            "(f == 3u) ? (a <= ref_value) :\n"
+            "              (f == 4u) ? (a > ref_value) : (f == 5u) ? (a != ref_value) : "
+            "(f == 6u) ? (a >= ref_value) :\n"
+            "              (f == 7u);\n"
+            "  if (!keep) discard;\n"
+            "}\n"), 1)
+        self.assertEqual(prelude.count("discard"), 1)
+        self.assertNotRegex(prelude, r"\b(RW|RasterizerOrdered)[A-Z]")
+        self.assertNotIn("earlydepthstencil", prelude)
+
+
 if __name__ == "__main__":
     unittest.main()

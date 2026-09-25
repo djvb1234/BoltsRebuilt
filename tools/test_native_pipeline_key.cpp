@@ -68,10 +68,11 @@ using Projection = std::vector<uint32_t>;
 Projection Descriptor(const Key& in) {
   const auto& w = in.words;
   Projection p;
-  p.reserve(62);
+  p.reserve(63);
   const auto add = [&](uint32_t value) { p.push_back(value); };
   for (unsigned i = 0; i < 6; ++i) add(w[i]);  // RTV formats, DSV, sample count
   add(w[17]);                                 // sample mask is never elided
+  add(w[18]);                                 // pixel shader blob: generated (0) or without AlphaTest (1)
   add(Bits(w[16], 2, 1));                     // retained owner-local root variant
   add(Bits(w[16], 1, 1) && w[5] > 1);          // actual alpha-to-coverage BOOL
   for (unsigned i = 0; i < 4; ++i) {
@@ -120,7 +121,7 @@ Projection Descriptor(const Key& in) {
   for (unsigned i = 0; i < 4; ++i) if (w[i]) targets = i + 1;
   add(targets);
   add(front && back);  // original pre-creation cull refusal also has to match
-  Check(p.size() == 62, "complete variable descriptor projection");
+  Check(p.size() == 63, "complete variable descriptor projection");
   return p;
 }
 Key Literal() {
@@ -202,9 +203,16 @@ void LiteralControls() {
     a = Literal(); a.words[15] = bits;
     Check(Normalize(a).words[15] == bits, "signed zero, NaN payloads, infinity and subnormal bits retained");
   }
+  a = Literal(); b = a; b.words[18] = 1;
+  Different(a, b, "the pixel shader without AlphaTest is a distinct pipeline");
+  // No other key word can make an alpha-testing lookup equal one without AlphaTest.
+  for (unsigned word = 0; word < 20; ++word) if (word != 18) for (unsigned bit = 0; bit < 32; ++bit) {
+    auto other = b; other.words[word] ^= uint32_t(1) << bit;
+    Check(Normalize(a).words[18] != Normalize(other).words[18], "pixel shader choice survives every other input");
+  }
   a = Literal(); a.words[18] = 0x12345678; a.words[19] = 0xABCDEF01;
   const auto n = Normalize(a);
-  Check(n.words[18] == a.words[18] && n.words[19] == a.words[19], "future reserved key words left intact");
+  Check(n.words[18] == a.words[18] && n.words[19] == a.words[19], "pixel shader choice and reserved key word left intact");
 }
 uint32_t Random(uint64_t& state) {
   state ^= state >> 12; state ^= state << 25; state ^= state >> 27;

@@ -11,7 +11,8 @@ namespace nb::gpu {
 // Layout is the original NativeGeometryPass::PipelineKey: RTVs[0..3], DSV[4],
 // sample count[5], blend controls[6..9], depth[10], setup[11], color mask[12],
 // stencil ref/masks[13], integer/float bias bits[14..15], clip/coverage/root-CBV
-// flags[16], sample mask[17], reserved[18..19]. DXGI_FORMAT_UNKNOWN is zero.
+// flags[16], sample mask[17], pixel shader without AlphaTest[18] (0 or 1),
+// reserved[19]. DXGI_FORMAT_UNKNOWN is zero.
 // Return whether any input word changed. No allocation or floating-point work.
 inline bool NormalizeNativePipelineKey(uint32_t (&words)[20]) noexcept {
   uint32_t changed = 0;
@@ -63,9 +64,10 @@ inline bool NormalizeNativePipelineKey(uint32_t (&words)[20]) noexcept {
   if (words[5] <= 1) {
     replace(16, words[16] & ~0x2u);  // AlphaToCoverageEnable is explicitly false
   }
-  // Formats, sample mask/count, root variant, depth clip, raw float bits and
-  // reserved words are intentionally left intact. No hardware-ignored-field
-  // assumptions, enum remapping, cross-pass sharing or zero-depth elision.
+  // Formats, sample mask/count, root variant, depth clip, raw float bits, the
+  // pixel shader choice and the reserved word are intentionally left intact.
+  // No hardware-ignored-field assumptions, enum remapping, cross-pass sharing
+  // or zero-depth elision.
   return changed != 0;
 }
 

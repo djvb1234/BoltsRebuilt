@@ -30,6 +30,7 @@
 #include "nb_cp_records.h"
 #include "nb_graphics_system.h"
 #include "native/offline_texture_cache.h"
+#include "native/native_alpha_test_variant.h"
 #include "native/native_range_batch.h"
 #include "native/native_range_diagnostics.h"
 #include "native/native_shared_residency_mirror.h"
@@ -202,6 +203,12 @@ REXCVAR_DEFINE_STRING(nb_native_trace_pair, "", "nb",
                       "Log the draw state a translated shader depends on for pairs whose stem contains this");
 REXCVAR_DEFINE_BOOL(nb_native_alpha_test, true, "nb",
                     "Apply the guest's alpha test in native draws (off: bisecting aid for black surfaces)");
+REXCVAR_DEFINE_BOOL(nb_native_alpha_test_variant, true, "nb",
+                    "Select a native pixel shader without the alpha-test discard when alpha test is off (or always "
+                    "passes), which permits early depth/stencil for depth- or stencil-writing draws; equivalent at "
+                    "the HLSL level because the removed discard can never fire for the selected draws, but not "
+                    "guaranteed bit-identical, since the compile allows float refactoring (false: the previous "
+                    "single-shader path exactly)");
 REXCVAR_DEFINE_BOOL(nb_native_vertex_kill, true, "nb",
                     "Apply the guest's vertex kill in native draws (off: bisecting aid)");
 REXCVAR_DEFINE_BOOL(nb_native_stencil, true, "nb",
@@ -814,6 +821,13 @@ void NbCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
                 frames_since_log_, native_stacked_texture_draws_);
     REXLOG_INFO("rexgpu-nb:   native cube texture draws {} / extra vertex stream draws {} over the last {} frames",
                 native_cube_texture_draws_, native_extra_stream_draws_, frames_since_log_);
+    if (REXCVAR_GET(nb_native_alpha_test_variant) || native_no_alpha_test_draws_ ||
+        native_no_alpha_test_pending_ || native_no_alpha_test_unavailable_) {
+      REXLOG_INFO("rexgpu-nb:   native draws selecting the pixel shader without alpha test over the last {} frames: "
+                  "{} used it, {} used the base shader while it or its pipeline was not ready, {} with it unavailable",
+                  frames_since_log_, native_no_alpha_test_draws_, native_no_alpha_test_pending_,
+                  native_no_alpha_test_unavailable_);
+    }
     if (native_asset_cache_.initialized()) {
       const auto& assets = native_asset_cache_.stats();
       REXLOG_INFO("rexgpu-nb:   native asset buffers cumulative: {} hits ({} cached), {} misses, {} snapshots / {} bytes, {} CPU-authority refusals, {} invalidation races",
@@ -1096,6 +1110,9 @@ void NbCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
     native_stacked_texture_draws_ = 0;
     native_cube_texture_draws_ = 0;
     native_extra_stream_draws_ = 0;
+    native_no_alpha_test_draws_ = 0;
+    native_no_alpha_test_pending_ = 0;
+    native_no_alpha_test_unavailable_ = 0;
     std::memset(texture_failures_, 0, sizeof texture_failures_);
     std::memset(texture_failure_dimensions_, 0, sizeof texture_failure_dimensions_);
     issue_draw_ns_ = 0;
@@ -1301,7 +1318,7 @@ uint32_t NbCommandProcessor::GuestTextureIndex(const rex::graphics::d3d12::D3D12
   return UINT32_MAX;
 }
 
-void NbCommandProcessor::LogNativeDraw(const char* pass, const NativeDrawContext& context) {
+void NbCommandProcessor::LogNativeDraw(const char* pass, const NativeDrawContext& context, bool no_alpha_test) {
   stats_.native_draws++;
   native_this_frame_++;
   // One frame logged draw by draw, in order, is how a surface gets traced back to its shader pair: the
@@ -1311,12 +1328,12 @@ void NbCommandProcessor::LogNativeDraw(const char* pass, const NativeDrawContext
   if (log_frame > 0 && static_cast<uint64_t>(log_frame) == stats_.frames + 1) {
     rex::graphics::reg::RB_DEPTHCONTROL depth;
     depth.value = register_file_->Get<uint32_t>(rex::graphics::XE_GPU_REG_RB_DEPTHCONTROL);
-    REXLOG_INFO("rexgpu-nb: frameseq {} pair {:016X}_{:016X} prim {} x{} zenable {} zwrite {} zfunc {} rtv0 {} dsv {}",
+    REXLOG_INFO("rexgpu-nb: frameseq {} pair {:016X}_{:016X} prim {} x{} zenable {} zwrite {} zfunc {} rtv0 {} dsv {}{}",
                 native_this_frame_, context.vertex_shader->ucode_data_hash(),
                 context.pixel_shader ? context.pixel_shader->ucode_data_hash() : 0ull,
                 static_cast<uint32_t>(context.guest_primitive_type), context.index_count,
                 uint32_t(depth.z_enable), uint32_t(depth.z_write_enable), uint32_t(depth.zfunc),
-                int(context.rtv_formats[0]), int(context.dsv_format));
+                int(context.rtv_formats[0]), int(context.dsv_format), no_alpha_test ? " ps without alpha test" : "");
   }
   if (stats_.native_draws <= 3 ||
       (!REXCVAR_GET(nb_native_minimal_diagnostics) && (stats_.native_draws % 600) == 0)) {
@@ -1941,10 +1958,35 @@ bool NbCommandProcessor::TryGenericPassImpl(const NativeDrawContext& context) {
     args.ps_constants = nullptr;
     args.ps_constant_count = 1;
   }
-  if (!pair->pass.Record(*this, context, state, root, args)) {
+  // nb_native_alpha_test_variant: when the alpha-test word this draw uploads cannot reach AlphaTest's
+  // discard, and the draw writes depth or stencil where an early test could skip shading, ask for the
+  // pixel shader without it. Until that shader and its pipeline are ready the draw records with the
+  // generated one, exactly as with the switch off.
+  bool no_alpha_test_selected = false;
+  auto no_alpha_test = NativeShaderLibrary::VariantStatus::kUnavailable;
+  if (REXCVAR_GET(nb_native_alpha_test_variant) && pair->ps && pair->ps->no_alpha_test_eligible &&
+      NativeAlphaTestVariantSelected(root.alpha_test[0], context.dsv_format != DXGI_FORMAT_UNKNOWN,
+                                     state.depthcontrol, state.stencil_ref_mask, state.alpha_to_mask,
+                                     context.sample_count)) {
+    no_alpha_test_selected = true;
+    no_alpha_test = library.RequestNoAlphaTest(*pair);
+    args.no_alpha_test = no_alpha_test == NativeShaderLibrary::VariantStatus::kReady;
+  }
+  bool no_alpha_test_used = false;
+  if (!pair->pass.Record(*this, context, state, root, args, &no_alpha_test_used)) {
     pair->skips++;
     generic_refusals_[kRefusedRecord]++;
     return false;
+  }
+  if (no_alpha_test_selected) {
+    if (no_alpha_test_used) {
+      ++native_no_alpha_test_draws_;
+    } else if (no_alpha_test == NativeShaderLibrary::VariantStatus::kUnavailable ||
+               pair->pass.no_alpha_test_failed()) {
+      ++native_no_alpha_test_unavailable_;
+    } else {
+      ++native_no_alpha_test_pending_;
+    }
   }
   pair->draws++;
   if (uses_empty_texture) ++native_empty_texture_draws_;
@@ -1952,7 +1994,7 @@ bool NbCommandProcessor::TryGenericPassImpl(const NativeDrawContext& context) {
   if (uses_stacked_texture) ++native_stacked_texture_draws_;
   if (uses_cube_texture) ++native_cube_texture_draws_;
   if (pair->vs->streams.size() > 2) ++native_extra_stream_draws_;
-  LogNativeDraw(pair->stem.c_str(), context);
+  LogNativeDraw(pair->stem.c_str(), context, no_alpha_test_used);
   return true;
 }
 
