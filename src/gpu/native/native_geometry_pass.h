@@ -102,7 +102,7 @@ class NativeGeometryPass {
     // streams travel in the vertex constant buffer: base, stride, endian, reserved.
     uint32_t extra_vertex_streams[kMaxVertexStreams - 2][4] = {};
     uint32_t index_size_bytes = 0;  // guest index extent before primitive expansion
-    bool hardware_index_eligible = false;  // exact direct DMA triangle-list agreement, before diagnostic toggle
+    bool hardware_index_eligible = false;  // exact direct DMA triangle-list match, before nb_native_hardware_indices
     bool use_hardware_indices = false;
     NativeAssetCache* asset_cache = nullptr;
     bool legacy_asset_cache = false;  // diagnostic baseline for same-run comparisons
