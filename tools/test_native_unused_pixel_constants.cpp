@@ -1,4 +1,4 @@
-// Original synthetic control of the ACTUAL native b2 reflection proof and
+// Original synthetic control of the ACTUAL native constant-buffer reflection proofs and
 // immutable CBV aliasing. No game data. The caller owns the machine lock.
 // Does not exercise NativeGeometryPass/CP orchestration or upload-pool reclaim.
 #ifndef NOMINMAX
@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "native_constant_reuse.h"
 #include "native_shader_constant_reflection.h"
 
 using Microsoft::WRL::ComPtr;
@@ -149,9 +150,38 @@ std::vector<uint8_t> Read(ID3D12Resource* buffer, size_t bytes) {
   Check(buffer->Map(0, &range, &mapping), "readback map");
   std::memcpy(result.data(), mapping, bytes); buffer->Unmap(0, &none); return result;
 }
+// Explicit empty constant layouts rely on the same proof with nonzero headers,
+// the limits NativeGeometryPass::Initialize passes: b1 ends at
+// kVertexConstantHeaderBytes (688, native_geometry_pass.h) and b2 at
+// NativePixelConstantPacket::kHeaderBytes, as in prelude.hlsl. A read of the
+// last header entry stays provable; a float read, or a limit one entry short,
+// refuses.
+constexpr uint32_t kVertexHeader = 688;
+constexpr uint32_t kPixelHeader = uint32_t(nb::gpu::NativePixelConstantPacket::kHeaderBytes);
+static_assert(kVertexHeader == (2 + 5 + 5 + 14 + 17) * 16 && kPixelHeader == (2 + 5 + 5) * 16,
+              "synthetic cbuffers below must match the native headers");
+void HeaderExtentControls() {
+  const std::string b1 = "cbuffer NbVsConstants:register(b1){uint4 bools[2];uint4 tex_swizzle[5];"
+      "uint4 tex_sampler[5];uint4 extra_vertex_streams[14];uint4 asset_bindings[17];float4 vs_c[256];};\n";
+  const std::string b2 = "cbuffer NbPsConstants:register(b2){uint4 ps_bools[2];uint4 ps_tex_swizzle[5];"
+      "uint4 ps_tex_sampler[5];float4 ps_c[256];};\n";
+  for (bool floats : {false, true}) {
+    auto vs = Compile(b1 + "float4 main():SV_Position{return float4(bools[0]^asset_bindings[16])" +
+                      (floats ? "+vs_c[0]" : "") + ";}", "vs_5_1");
+    auto ps = Compile(b2 + "float4 main():SV_Target{return float4(ps_bools[0]^ps_tex_sampler[4])" +
+                      (floats ? "+ps_c[0]" : "") + ";}", "ps_5_1");
+    Require(nb::gpu::ShaderConstantHeaderOnly(vs.Get(), 1, kVertexHeader) == !floats, "actual b1 header proof");
+    Require(nb::gpu::ShaderConstantHeaderOnly(ps.Get(), 2, kPixelHeader) == !floats, "actual b2 header proof");
+    Require(!nb::gpu::ShaderConstantHeaderOnly(vs.Get(), 1, kVertexHeader - 16), "last used b1 header entry bounds the proof");
+    Require(!nb::gpu::ShaderConstantHeaderOnly(ps.Get(), 2, kPixelHeader - 16), "last used b2 header entry bounds the proof");
+    Require(nb::gpu::ShaderConstantHeaderOnly(vs.Get(), 2, kPixelHeader) &&
+            nb::gpu::ShaderConstantHeaderOnly(ps.Get(), 1, kVertexHeader), "stage without the other binding is harmless");
+  }
+}
 struct Fixture { unsigned shader; bool enabled, force; };
 
 void Run(bool warp) {
+  HeaderExtentControls();
   std::array<ComPtr<ID3DBlob>, 4> vs, ps;
   std::array<bool, 4> proven{};
   for (unsigned mode = 0; mode < 4; ++mode) {

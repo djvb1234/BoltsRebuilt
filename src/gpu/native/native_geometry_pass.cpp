@@ -54,7 +54,8 @@ REXCVAR_DEFINE_BOOL(nb_native_shader_debug, false, "nb",
                     "Compile the generated native shaders with debug info and no optimisation, so a RenderDoc capture can be stepped with the guest register names intact (capture runs only)");
 
 REXCVAR_DEFINE_BOOL(nb_native_constant_reuse, true, "nb",
-                    "Reuse exact same-frame pixel constant bytes and the last fully matched ready native pipeline; false keeps the diagnostic original path");
+                    "Reuse exact same-frame pixel constant bytes and the last fully matched ready native pipeline; false keeps the diagnostic original path "
+                    "(full float uploads also need nb_native_empty_constant_layout=false)");
 
 REXCVAR_DEFINE_BOOL(nb_native_pipeline_key_normalize, false, "nb",
                     "Normalize only unused native PSO key fields while preserving the original descriptor and guest state")
@@ -74,8 +75,9 @@ REXCVAR_DEFINE_BOOL(nb_native_vertex_constant_reuse, false, "nb",
 REXCVAR_DEFINE_BOOL(nb_native_double_pixel_packets, false, "nb",
                     "Publish uploaded pixel constant packets by changing owned RAM slots, avoiding the extra cache snapshot copy");
 
-REXCVAR_DEFINE_BOOL(nb_native_empty_constant_layout, false, "nb",
-                    "Omit unread guest float data only for validated explicitly empty generated constant layouts")
+REXCVAR_DEFINE_BOOL(nb_native_empty_constant_layout, true, "nb",
+                    "Omit unread guest float data only for validated explicitly empty generated constant layouts; "
+                    "false restores the full 256-register upload")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(nb_native_unused_pixel_constants, false, "nb",

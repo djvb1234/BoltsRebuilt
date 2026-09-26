@@ -16,6 +16,12 @@ nb_transfer_stencil_coverage = true
 nb_texture_layout_memo = true
 nb_scaled_resolve_memo = true
 
+# Exact command-thread CPU savings: reuse each texture's last SRV lookup and keep
+# constructed deferred-command storage between submissions. Setting either to
+# false restores the original path.
+nb_native_texture_descriptor_memo = true
+nb_native_deferred_storage = true
+
 # Serialize streaming pool reset/lookup; trace remains enabled for preview reports.
 nb_pool_trace = true
 nb_pool_reset_lock = true
