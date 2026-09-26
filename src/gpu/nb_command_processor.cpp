@@ -166,9 +166,9 @@ REXCVAR_DEFINE_STRING(nb_native_asset_pack, "", "nb",
                       "Optional local immutable geometry pack; empty keeps guest shared-memory buffers");
 REXCVAR_DEFINE_INT32(nb_native_asset_cache_mode, 0, "nb",
                      "Geometry matching: 0 off, 1 legacy, 2 optimized; F6 toggles off/optimized");
-// With the default minimal diagnostics this benchmark's perf: lines print residency_ms/assets_ms and
-// IssueDraw_ms/generic_ms as 0; set nb_native_minimal_diagnostics and
-// nb_native_minimal_command_diagnostics to false to keep them.
+// A configured run sets nb_native_minimal_diagnostics and nb_native_minimal_command_diagnostics
+// to false at startup: its residency_ms/assets_ms and IssueDraw_ms/generic_ms comparison needs the
+// detailed clocks that normal play now omits.
 REXCVAR_DEFINE_INT64(nb_native_asset_benchmark_start, 0, "nb",
                      "First frame of a six-window legacy/optimized/off/off/optimized/legacy comparison; 0 disables");
 REXCVAR_DEFINE_INT32(nb_native_asset_benchmark_frames, 300, "nb",
@@ -492,6 +492,13 @@ NbCommandProcessor::NbCommandProcessor(NbGraphicsSystem* graphics_system,
   REXLOG_INFO("rexgpu-nb: runtime watch fastpath available {} initial mode {}",
               nb::runtime::WatchFastpathAvailable(), nb::runtime::GetWatchFastpathMode());
 #endif
+  if (REXCVAR_GET(nb_native_asset_benchmark_start) > 0 && REXCVAR_GET(nb_native_perf_benchmark_start) <= 0) {
+    // The geometry-cache benchmark compares clock-derived costs; the performance benchmark sets
+    // these per window instead.
+    REXCVAR_SET(nb_native_minimal_diagnostics, false);
+    REXCVAR_SET(nb_native_minimal_command_diagnostics, false);
+    REXLOG_INFO("rexgpu-nb: geometry-cache benchmark configured; detailed per-draw clocks enabled");
+  }
   perf_default_options_ = CurrentPerfOptions();
   const auto initial_phase = AssetPhaseForFrame(1);
   asset_cache_mode_ = initial_phase.mode;
