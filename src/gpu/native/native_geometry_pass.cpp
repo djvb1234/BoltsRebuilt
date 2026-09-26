@@ -39,8 +39,10 @@ REXCVAR_DEFINE_UINT32(nb_native_vertex_range_census_last, 18000, "nb", "Last bac
 REXCVAR_DEFINE_UINT32(nb_native_vertex_range_census_period, 600, "nb", "Sample one backend frame per period, relative to first; zero samples every frame");
 
 
-REXCVAR_DEFINE_BOOL(nb_native_minimal_diagnostics, false, "nb",
-                    "Skip fine-grained per-draw clocks and periodic draw log spam; frame, IssueDraw, generic and refusal diagnostics remain");
+REXCVAR_DEFINE_BOOL(nb_native_minimal_diagnostics, true, "nb",
+                    "Skip fine-grained per-draw clocks and the log of every 600th native draw, so perf: residency_ms/assets_ms and the "
+                    "native draw CPU ms figures read 0 (residency hit/miss and invalidation counts stay live); false restores both. "
+                    "Frame, swap and refusal diagnostics remain");
 REXCVAR_DEFINE_BOOL(nb_native_constant_upload_diagnostics, false, "nb",
                     "Time native constant allocation, RAM assembly, mapped fill and memo operations on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);

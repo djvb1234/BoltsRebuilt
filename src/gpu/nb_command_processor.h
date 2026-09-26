@@ -136,7 +136,8 @@ class NbCommandProcessor : public rex::graphics::d3d12::D3D12CommandProcessor {
   uint32_t shaders_this_frame_ = 0;
   uint32_t native_this_frame_ = 0;
   // CPU time (nanoseconds) since the last periodic frame log: the whole SDK IssueDraw (including our
-  // seam) and the generic pass alone, to tell a CPU-bound native path from a GPU-bound one.
+  // seam) and the generic pass alone, to tell a CPU-bound native path from a GPU-bound one. All but
+  // the swap time stay 0 unless nb_native_minimal_command_diagnostics is false.
   uint64_t issue_draw_ns_ = 0;
   uint64_t generic_pass_ns_ = 0;
   uint64_t shader_load_ns_ = 0;
