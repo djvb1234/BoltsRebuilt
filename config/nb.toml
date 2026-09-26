@@ -57,8 +57,6 @@ nb_native_stencil = true
 # Eligible DMA-indexed triangle lists draw with a real index buffer, so the GPU
 # can reuse shaded vertices; other native indexed draws keep the vertex-shader
 # index gather, and false restores the gather for every eligible draw.
-# Performance benchmark windows run without it: the default
-# nb_native_perf_benchmark_options masks clear bit 256.
 nb_native_hardware_indices = true
 
 # The guest normally presents every second vblank: 480 Hz permits up to 240 FPS.

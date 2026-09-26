@@ -90,6 +90,7 @@ REXCVAR_DECLARE(bool, nb_native_early_wait_poll);
 REXCVAR_DECLARE(bool, nb_native_narrow_invalidation);
 REXCVAR_DECLARE(bool, nb_native_invalidation_diagnostics);
 REXCVAR_DECLARE(int32_t, anisotropic_override);
+REXCVAR_DECLARE(bool, nb_rt_ownership_fastpath);
 REXCVAR_DEFINE_BOOL(nb_native_minimal_command_diagnostics, true, "nb",
                     "Omit per-command shader/draw/copy and generic CPU clocks, so IssueDraw/generic and shader-load/copy "
                     "figures read 0; false restores them. Wall-frame and swap timing remain")
@@ -129,13 +130,14 @@ REXCVAR_DEFINE_BOOL(nb_native_immutable_watch_fastpath, false, "nb",
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT64(nb_native_perf_benchmark_start, 0, "nb",
                      "First frame of the native performance comparison; prewarms both shader forms from frame 3600, 0 disables");
-// Every default window holds the shipped defaults other than 16384 (bits 1 to 64, 1024, 65536,
-// 1048576 and 8589934592) plus 128; the windows differ only in 2048 and 4096. 16384 stays clear
-// so the perf: lines keep IssueDraw_ms/generic_ms, which means these windows run the per-command
-// clocks that normal play omits. ApplyPerfOptions sets every bit, so a custom list must carry
-// the defaults it means to keep.
+// Every default window holds the shipped defaults other than 16384 (bits 1 to 64, 256, 1024,
+// 65536, 1048576, 8589934592, 35184372088832 and 70368744177664) plus 128; the windows differ
+// only in 2048 and 4096. 16384 stays clear so the perf: lines keep IssueDraw_ms/generic_ms,
+// which means these windows run the per-command clocks that normal play omits.
+// ApplyPerfOptions sets every bit, so a custom list must carry the defaults it means to keep.
 REXCVAR_DEFINE_STRING(nb_native_perf_benchmark_options,
-                      "8591049983,8591052031,8591054079,8591056127,8591056127,8591054079,8591052031,8591049983", "nb",
+                      "105561707316735,105561707318783,105561707320831,105561707322879,"
+                      "105561707322879,105561707320831,105561707318783,105561707316735", "nb",
                       "Comma-separated performance bitmasks (2 to 32 windows); fixed at benchmark startup");
 
 REXCVAR_DEFINE_BOOL(nb_native_demo, false, "nb",
@@ -334,6 +336,8 @@ AssetBenchmarkPhase AssetPhaseForFrame(uint64_t frame) {
   // 17179869184 stores unchanged native CBV setters in one deferred packet.
   // 34359738368 serves native constant slices from CPU-writable video memory.
   // 17592186044416 re-reads blocked WAIT_REG_MEM predicates at yield cadence for up to 5 ms.
+  // 35184372088832 draws alpha-test-free native pixel shaders when the alpha test cannot discard.
+  // 70368744177664 skips render-target claims that the ownership map already satisfies.
   if (offset / length >= (perf_start > 0 ? PerfBenchmarkOptions().size() : std::size(modes))) return phase;
   phase.window = int(offset / length);
   if (perf_start > 0) phase.options = PerfBenchmarkOptions()[phase.window];
@@ -386,6 +390,8 @@ int64_t CurrentPerfOptions() {
          (REXCVAR_GET(nb_native_unused_pixel_constants) ? 4398046511104LL : 0) |
          (REXCVAR_GET(nb_native_texture_outdated_load_first) ? 8796093022208LL : 0) |
          (REXCVAR_GET(nb_native_wait_spin_us) > 0 ? 17592186044416LL : 0) |
+         (REXCVAR_GET(nb_native_alpha_test_variant) ? 35184372088832LL : 0) |
+         (REXCVAR_GET(nb_rt_ownership_fastpath) ? 70368744177664LL : 0) |
          (REXCVAR_GET(nb_native_replay_chunk_draws) >= 2048 ? 2199023255552LL :
           REXCVAR_GET(nb_native_replay_chunk_draws) > 0 ? 1099511627776LL : 0)
 #if NB_HAS_RUNTIME_WATCH_CONTROL
@@ -434,6 +440,8 @@ void ApplyPerfOptions(int64_t options) {
   REXCVAR_SET(nb_native_unused_pixel_constants, (options & 4398046511104LL) != 0);
   REXCVAR_SET(nb_native_texture_outdated_load_first, (options & 8796093022208LL) != 0);
   REXCVAR_SET(nb_native_wait_spin_us, (options & 17592186044416LL) ? 5000 : 0);
+  REXCVAR_SET(nb_native_alpha_test_variant, (options & 35184372088832LL) != 0);
+  REXCVAR_SET(nb_rt_ownership_fastpath, (options & 70368744177664LL) != 0);
   REXCVAR_SET(nb_native_replay_chunk_draws, (options & 2199023255552LL) ? 2048 :
                                         (options & 1099511627776LL) ? 1024 : 0);
 #if NB_HAS_RUNTIME_WATCH_CONTROL
