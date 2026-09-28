@@ -270,7 +270,6 @@ const std::vector<int64_t>& PerfBenchmarkOptions() {
       const size_t end = comma == std::string::npos ? text.size() : comma;
       int64_t value = 0;
       const auto parsed = std::from_chars(text.data() + start, text.data() + end, value);
-      // Bits 0 to 56: the options up to 2^46 plus the slots reserved up to 2^56. A higher bit is a typo.
       if (parsed.ec != std::errc{} || parsed.ptr != text.data() + end || value < 0 ||
           value > 144115188075855871LL || result.size() == 32 || end + 1 == text.size()) {
         REXLOG_ERROR("rexgpu-nb: invalid performance benchmark option list");
