@@ -68,6 +68,10 @@ struct Phase3Counters {
   // pipeline creation await) from D3D12CommandProcessor::EndSubmission. This
   // is the residual step-6 stall.
   uint64_t swap_wait_time_us = 0;
+  // nb: resolves served by the direct host render target resolve (direct_host_resolve), which skip
+  // the EDRAM dump, and resolves it was tried on that kept the dump.
+  uint64_t direct_resolve_count = 0;
+  uint64_t direct_resolve_fallback_count = 0;
 
   void Reset() { *this = Phase3Counters{}; }
 
@@ -84,12 +88,13 @@ struct Phase3Counters {
                  ",\"alias_hits\":%" PRIu64 ",\"alias_misses\":%" PRIu64
                  ",\"texture_reloads_from_resolved_ranges\":%" PRIu64
                  ",\"readback_resolve_uses\":%" PRIu64
-                 ",\"swap_wait_time_us\":%" PRIu64 "}\n",
+                 ",\"swap_wait_time_us\":%" PRIu64
+                 ",\"direct_resolves\":%" PRIu64 ",\"direct_resolve_fallbacks\":%" PRIu64 "}\n",
                  frame, transfer_count, transfer_tiles, resolve_dump_count, tile_pass_count,
                  duplicated_draw_across_passes_count, record_time_pipeline_skip_count,
                  execute_time_null_handle_count, alias_hit_count, alias_miss_count,
                  texture_reload_from_resolved_range_count, readback_resolve_use_count,
-                 swap_wait_time_us);
+                 swap_wait_time_us, direct_resolve_count, direct_resolve_fallback_count);
   }
 };
 
