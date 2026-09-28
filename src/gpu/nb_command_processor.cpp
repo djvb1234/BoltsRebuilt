@@ -635,15 +635,22 @@ void NbCommandProcessor::ShutdownContext() {
   }
   // Queued draws must finish before the arena and its SharedMemory watch leave.
   const bool native_resources_idle = AwaitNativeResourcesIdle();
-  native_asset_cache_.Shutdown();
-  NativeGeometryPass::ReleaseResidencyWatch();
   // A failed drain is not permission to release buffers still referenced by the
-  // GPU. Shutdown(false) retains their resource references even through pool
-  // destruction; a healthy device and completed drain permit normal release.
+  // GPU. Shutdown(false) retains their resource references (the asset arena and
+  // its staging buffer, and the constant pool even through pool destruction); a
+  // healthy device and completed drain permit normal release. Without an async
+  // replay worker a failed drain returns here directly, so this gate is the only
+  // thing standing between it and the release.
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  const bool completion_proven = native_resources_idle && device &&
+                                 SUCCEEDED(device->GetDeviceRemovedReason());
+  const bool asset_arena_live = native_asset_cache_.initialized();
+  native_asset_cache_.Shutdown(completion_proven);
+  NativeGeometryPass::ReleaseResidencyWatch();
+  if (asset_arena_live && !completion_proven) {
+    REXLOG_WARN("rexgpu-nb: native GPU completion unproven; retaining asset arena references");
+  }
   if (constant_upload_pool_) {
-    ID3D12Device* device = GetD3D12Provider().GetDevice();
-    const bool completion_proven = native_resources_idle && device &&
-                                   SUCCEEDED(device->GetDeviceRemovedReason());
     constant_upload_pool_->Shutdown(completion_proven);
     if (!completion_proven) {
       REXLOG_WARN("rexgpu-nb: constant pool GPU completion unproven; retaining resource references");

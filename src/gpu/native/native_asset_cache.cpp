@@ -336,9 +336,14 @@ D3D12_GPU_VIRTUAL_ADDRESS NativeAssetCache::gpu_address() const {
 }
 bool NativeAssetCache::initialized() const { return bool(impl_->gpu); }
 const NativeAssetCache::Stats& NativeAssetCache::stats() const { return impl_->counters; }
-void NativeAssetCache::Shutdown() {
+void NativeAssetCache::Shutdown(bool completion_proven) {
   if (impl_->watch && impl_->shared) impl_->shared->UnregisterGlobalWatch(impl_->watch);
   impl_->watch = nullptr;
+  if (!completion_proven) {
+    // Queued draws and the arena upload may still reference these on the GPU.
+    impl_->gpu.Detach();
+    impl_->staging.Detach();
+  }
   impl_ = std::make_unique<Impl>();
 }
 
