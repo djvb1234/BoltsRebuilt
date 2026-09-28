@@ -167,6 +167,25 @@ class NativeGeometryPass {
   // A pipeline creation with that shader failed; every draw of the pass then uses the base shader.
   bool no_alpha_test_failed() const { return no_alpha_test_failed_; }
 
+  // The refusals Record makes before any lookup, allocation or command: pass state, a draw with no
+  // host vertices, and a constant layout or root signature the pass cannot serve. They depend only
+  // on the pass, DrawArgs and switches, so a caller may ask before paying for texture bindings.
+  // Record asks the same question first, so the two can never disagree.
+  bool RefusesBeforeWork(const DrawArgs& args);
+
+  // Why Record returned false, by the stage that refused. Cumulative, command processor thread only.
+  enum RecordRefusal : uint32_t {
+    kRecordRefusedPassState,         // RefusesBeforeWork
+    kRecordRefusedPipelinePending,   // pipeline still being created, or queued by this draw
+    kRecordRefusedPipelineThrottled, // no creation slot free, so not queued yet
+    kRecordRefusedPipelineKnownBad,  // creation failed earlier, or both faces culled
+    kRecordRefusedSamplerHeap,       // RequestSamplerBindlessIndices
+    kRecordRefusedConstantSlice,     // upload pool could not serve a constant buffer
+    kRecordRefusedResidency,         // RequestRanges
+    kRecordRefusedCount
+  };
+  static const uint64_t* record_refusals();  // kRecordRefusedCount entries
+
   // `no_alpha_test_used`, when given, says whether a recorded draw used that pixel shader.
   bool Record(rex::graphics::d3d12::D3D12CommandProcessor& cp,
               const rex::graphics::d3d12::D3D12CommandProcessor::NativeDrawContext& context,
@@ -240,6 +259,8 @@ class NativeGeometryPass {
       const GuestState& state, bool root_cbv);
 
   std::string name_;
+  // Why the latest base GetPipeline returned null (a RecordRefusal pipeline cause).
+  RecordRefusal pipeline_miss_ = kRecordRefusedPipelinePending;
   bool initialized_ = false;
   bool direct_guest_reads_ = false;  // specialized bytecode; refuses non-null DrawArgs::asset_cache
   ID3D12Device* device_ = nullptr;

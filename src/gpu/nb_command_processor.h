@@ -140,6 +140,7 @@ class NbCommandProcessor : public rex::graphics::d3d12::D3D12CommandProcessor {
   // the swap time stay 0 unless nb_native_minimal_command_diagnostics is false.
   uint64_t issue_draw_ns_ = 0;
   uint64_t generic_pass_ns_ = 0;
+  uint64_t generic_refused_ns_ = 0;  // the part of generic_pass_ns_ spent on draws it refused
   uint64_t shader_load_ns_ = 0;
   uint64_t issue_copy_ns_ = 0;
   uint64_t issue_swap_ns_ = 0;
