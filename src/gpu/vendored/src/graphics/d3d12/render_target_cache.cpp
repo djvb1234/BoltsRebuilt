@@ -40,6 +40,9 @@
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+#include "native/native_shader_cache.h"
+#include "native/native_transfer_stencil_predication.h"
+
 REXCVAR_DECLARE(bool, nb_native_static_bindings);
 
 REXCVAR_DEFINE_BOOL(native_stencil_value_output_d3d12_intel, false, "GPU/D3D12",
@@ -83,6 +86,15 @@ REXCVAR_DEFINE_STRING(nb_transfer_stencil_coverage_verify_frames, "", "nb",
                       "Diagnostic: in frames first-last, use the per-pixel stencil-bit passes and count with "
                       "occlusion queries whether they set exactly the SDK's stencil bits (one check per launch, "
                       "reported in the log; it adds GPU work, so never time inside it)");
+
+// nb: skip the stencil-bit passes of depth transfers whose bit no source sample has
+// (native/native_transfer_stencil_predication.h). A compute probe ORs the source stencil the draw can read
+// into eight predicates, and each pass is recorded under SetPredication, so only passes that would write
+// nothing are skipped.
+REXCVAR_DEFINE_BOOL(nb_transfer_stencil_bit_predication, false, "nb",
+                    "Skip depth-transfer stencil-bit passes for bits no source sample has, using a compute probe "
+                    "and D3D12 predication (output-identical)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // NbCommandProcessor counts a frame at its swap (nb_command_processor.cpp), so the frame being recorded is
 // one past the completed count, which is the frame trace's numbering.
@@ -134,6 +146,116 @@ struct NbStencilVerifyState {
   std::vector<NbStencilVerifyDraw> draws;
 };
 NbStencilVerifyState nb_stencil_verify;
+
+// nb: nb_transfer_stencil_bit_predication resources, created on first use and released in Shutdown. The
+// render target cache is a single instance. Failure to create anything leaves the passes unpredicated.
+struct NbStencilPredicationState {
+  ID3D12RootSignature* root_signature = nullptr;
+  ID3D12PipelineState* pipelines[2] = {};  // single-sampled, multisampled source
+  ID3D12Resource* predicates = nullptr;
+  ID3D12Resource* zeros = nullptr;  // never written; committed resources are created zeroed
+  D3D12_RESOURCE_STATES predicates_state = D3D12_RESOURCE_STATE_COPY_DEST;
+  bool unavailable = false;
+  bool logged_state = false;
+  uint64_t probed_draws = 0;
+  // Merged draw index within the current destination -> predicate slot, or UINT32_MAX when unpredicated.
+  std::vector<uint32_t> draw_slots;
+};
+NbStencilPredicationState nb_stencil_predication;
+
+void NbStencilPredicationRelease() {
+  NbStencilPredicationState& p = nb_stencil_predication;
+  rex::ui::d3d12::util::ReleaseAndNull(p.pipelines[1]);
+  rex::ui::d3d12::util::ReleaseAndNull(p.pipelines[0]);
+  rex::ui::d3d12::util::ReleaseAndNull(p.root_signature);
+  rex::ui::d3d12::util::ReleaseAndNull(p.predicates);
+  rex::ui::d3d12::util::ReleaseAndNull(p.zeros);
+  p.predicates_state = D3D12_RESOURCE_STATE_COPY_DEST;
+  p.unavailable = false;
+  p.draw_slots.clear();
+}
+
+bool NbStencilPredicationReady(const rex::ui::d3d12::D3D12Provider& provider) {
+  NbStencilPredicationState& p = nb_stencil_predication;
+  if (p.unavailable) return false;
+  if (p.pipelines[0] && p.pipelines[1] && p.predicates && p.zeros) return true;
+  ID3D12Device* device = provider.GetDevice();
+  bool ok = true;
+  if (!p.root_signature) {
+    D3D12_DESCRIPTOR_RANGE source_range = {};
+    source_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    source_range.NumDescriptors = 1;
+    source_range.BaseShaderRegister = 0;
+    source_range.RegisterSpace = 0;
+    source_range.OffsetInDescriptorsFromTableStart = 0;
+    D3D12_ROOT_PARAMETER parameters[3] = {};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[0].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[0].DescriptorTable.pDescriptorRanges = &source_range;
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    parameters[1].Descriptor.ShaderRegister = 0;
+    parameters[1].Descriptor.RegisterSpace = 0;
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[2].Constants.ShaderRegister = 0;
+    parameters[2].Constants.RegisterSpace = 0;
+    parameters[2].Constants.Num32BitValues = sizeof(nb::gpu::NbStencilProbeConstants) / sizeof(uint32_t);
+    parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+    root_desc.NumParameters = UINT(std::size(parameters));
+    root_desc.pParameters = parameters;
+    root_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    p.root_signature = rex::ui::d3d12::util::CreateRootSignature(provider, root_desc);
+    ok = p.root_signature != nullptr;
+  }
+  const pD3DCompile compile = nb::gpu::shader_cache::CompilerEntryPoint();
+  ok = ok && compile;
+  for (uint32_t multisampled = 0; ok && multisampled < 2; ++multisampled) {
+    if (p.pipelines[multisampled]) continue;
+    const D3D_SHADER_MACRO defines[] = {{"NB_STENCIL_PROBE_MS", "1"}, {nullptr, nullptr}};
+    ID3DBlob* blob = nullptr;
+    ID3DBlob* errors = nullptr;
+    const HRESULT hr = compile(nb::gpu::kNbStencilProbeHlsl.data(), nb::gpu::kNbStencilProbeHlsl.size(),
+                               "nb_stencil_probe", multisampled ? defines : nullptr, nullptr, "main", "cs_5_0",
+                               D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &errors);
+    if (FAILED(hr) || !blob) {
+      REXGPU_ERROR("nb: stencil-bit predication probe did not compile (0x{:08X}){}{}", uint32_t(hr),
+                   errors ? ": " : "",
+                   errors ? std::string(static_cast<const char*>(errors->GetBufferPointer()),
+                                        errors->GetBufferSize())
+                          : std::string());
+      ok = false;
+    } else {
+      p.pipelines[multisampled] = rex::ui::d3d12::util::CreateComputePipeline(
+          device, blob->GetBufferPointer(), blob->GetBufferSize(), p.root_signature);
+      ok = p.pipelines[multisampled] != nullptr;
+    }
+    if (blob) blob->Release();
+    if (errors) errors->Release();
+  }
+  for (uint32_t i = 0; ok && i < 2; ++i) {
+    ID3D12Resource*& buffer = i ? p.zeros : p.predicates;
+    if (buffer) continue;
+    D3D12_RESOURCE_DESC buffer_desc;
+    rex::ui::d3d12::util::FillBufferResourceDesc(buffer_desc, nb::gpu::kNbStencilPredicateBufferBytes,
+                                            i ? D3D12_RESOURCE_FLAG_NONE
+                                              : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    // Not CREATE_NOT_ZEROED: the zero source relies on the default zero initialization.
+    ok = SUCCEEDED(device->CreateCommittedResource(
+        &rex::ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+        i ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)));
+    if (!ok) buffer = nullptr;
+  }
+  if (!ok) {
+    REXGPU_ERROR("nb: stencil-bit predication unavailable; depth transfers keep all eight stencil-bit passes");
+    NbStencilPredicationRelease();
+    p.unavailable = true;
+    return false;
+  }
+  p.predicates_state = D3D12_RESOURCE_STATE_COPY_DEST;
+  return true;
+}
 
 void NbStencilVerifyRelease() {
   NbStencilVerifyState& v = nb_stencil_verify;
@@ -1182,6 +1304,7 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
   // nb: withdraw the draw extent estimate's GPU-written query registered in Initialize.
   SetDrawExtentGpuWrittenQuery(nullptr, nullptr);
   NbStencilVerifyRelease();
+  NbStencilPredicationRelease();
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_64bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_32bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_root_signature_);
@@ -4200,6 +4323,17 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
                 nb_stencil_coverage_transfers);
   }
 
+  // nb: stencil-bit predication, off inside the stencil check's window so the check sees every pass.
+  const bool nb_bit_predication =
+      REXCVAR_GET(nb_transfer_stencil_bit_predication) && !nb_verify_stencil_coverage;
+  if (nb_bit_predication != nb_stencil_predication.logged_state) {
+    nb_stencil_predication.logged_state = nb_bit_predication;
+    REXGPU_INFO("nb: stencil-bit transfer predication {} from frame {} ({} depth-to-stencil-bit draws probed "
+                "so far)",
+                nb_bit_predication ? "on" : "off", NbGetCompletedSwapCount() + 1,
+                nb_stencil_predication.probed_draws);
+  }
+
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
   uint64_t current_submission = command_processor_.GetCurrentSubmission();
@@ -4639,6 +4773,131 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         }
       }
 
+      // nb: stencil-bit predication probes, one per merged depth-to-stencil-bit draw, all recorded before
+      // the draws so the predicate buffer and the sources change state once.
+      NbStencilPredicationState& nb_predication = nb_stencil_predication;
+      nb_predication.draw_slots.clear();
+      if (need_stencil_bit_draws && nb_bit_predication && NbStencilPredicationReady(provider)) {
+        uint32_t nb_slot_count = 0;
+        for (auto it = current_transfer_invocations_.cbegin(); it != current_transfer_invocations_.cend();
+             ++it) {
+          auto it_first = it;
+          while (std::next(it) != current_transfer_invocations_.cend() &&
+                 it_first->CanBeMergedIntoOneDraw(*std::next(it))) {
+            ++it;
+          }
+          const bool probed = it_first->shader_key.mode == TransferMode::kDepthToStencilBit &&
+                              nb_slot_count < nb::gpu::kNbStencilPredicateSlots;
+          nb_predication.draw_slots.push_back(probed ? nb_slot_count++ : UINT32_MAX);
+        }
+        if (nb_slot_count) {
+          D3D12CommandProcessor::NativeGpuPassScope probe_scope(command_processor_, "transfer_stencil_probe",
+                                                                nb_slot_count);
+          command_processor_.PushTransitionBarrier(nb_predication.predicates, nb_predication.predicates_state,
+                                                   D3D12_RESOURCE_STATE_COPY_DEST);
+          command_processor_.SubmitBarriers();
+          command_list.D3DCopyBufferRegion(nb_predication.predicates, 0, nb_predication.zeros, 0,
+                                           uint64_t(nb_slot_count) * nb::gpu::kNbStencilPredicateSlotBytes);
+          command_processor_.PushTransitionBarrier(nb_predication.predicates, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+          const D3D12_RESOURCE_STATES probe_source_state =
+              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+          size_t nb_draw = 0;
+          for (auto it = current_transfer_invocations_.cbegin(); it != current_transfer_invocations_.cend();
+               ++it, ++nb_draw) {
+            auto it_first = it;
+            while (std::next(it) != current_transfer_invocations_.cend() &&
+                   it_first->CanBeMergedIntoOneDraw(*std::next(it))) {
+              ++it;
+            }
+            if (nb_predication.draw_slots[nb_draw] == UINT32_MAX) continue;
+            auto& probe_source = *static_cast<D3D12RenderTarget*>(it_first->transfer.source);
+            command_processor_.PushTransitionBarrier(probe_source.resource(),
+                                                     probe_source.SetResourceState(probe_source_state),
+                                                     probe_source_state);
+          }
+          command_processor_.SubmitBarriers();
+          command_list.D3DSetComputeRootSignature(nb_predication.root_signature);
+          command_list.D3DSetComputeRootUnorderedAccessView(
+              1, nb_predication.predicates->GetGPUVirtualAddress());
+          nb_draw = 0;
+          for (auto it = current_transfer_invocations_.cbegin(); it != current_transfer_invocations_.cend();
+               ++it, ++nb_draw) {
+            auto it_first = it;
+            while (std::next(it) != current_transfer_invocations_.cend() &&
+                   it_first->CanBeMergedIntoOneDraw(*std::next(it))) {
+              ++it;
+            }
+            const uint32_t slot = nb_predication.draw_slots[nb_draw];
+            if (slot == UINT32_MAX) continue;
+            ++nb_predication.probed_draws;
+            // Every merged transfer of a draw has the same source.
+            auto& probe_source = *static_cast<D3D12RenderTarget*>(it_first->transfer.source);
+            const RenderTargetKey probe_source_key = probe_source.key();
+            const bool probe_multisampled = probe_source_key.msaa_samples != xenos::MsaaSamples::k1X;
+            command_processor_.SetExternalPipeline(nb_predication.pipelines[probe_multisampled]);
+            command_list.D3DSetComputeRootDescriptorTable(
+                0, current_temporary_descriptors_gpu_[probe_source.temporary_srv_descriptor_index_stencil()]
+                       .second);
+            nb::gpu::NbStencilProbeConstants probe_constants = {};
+            probe_constants.slot_offset = nb::gpu::NbStencilPredicateOffset(slot, 0);
+            probe_constants.sample_count =
+                (probe_source_key.msaa_samples == xenos::MsaaSamples::k2X && !msaa_2x_supported_)
+                    ? 4
+                    : uint32_t(1) << uint32_t(probe_source_key.msaa_samples);
+            for (auto it_merged = it_first; it_merged <= it; ++it_merged) {
+              nb::gpu::NbTileRange pieces[2];
+              const uint32_t piece_count = nb::gpu::NbSplitTransferRangeAtSourceBase(
+                  it_merged->transfer.start_tiles, it_merged->transfer.end_tiles, probe_source_key.base_tiles,
+                  pieces);
+              for (uint32_t k = 0; k < piece_count; ++k) {
+                Transfer::Rectangle source_rectangles[Transfer::kMaxRectanglesWithCutout];
+                const uint32_t source_rectangle_count = Transfer::GetRangeRectangles(
+                    pieces[k].start, pieces[k].end, probe_source_key.base_tiles,
+                    probe_source_key.GetPitchTiles(), probe_source_key.msaa_samples,
+                    probe_source_key.Is64bpp(), source_rectangles);
+                for (uint32_t r = 0; r < source_rectangle_count; ++r) {
+                  const Transfer::Rectangle& source_rectangle = source_rectangles[r];
+                  probe_constants.x = source_rectangle.x_pixels * draw_resolution_scale_x();
+                  probe_constants.y = source_rectangle.y_pixels * draw_resolution_scale_y();
+                  probe_constants.width = source_rectangle.width_pixels * draw_resolution_scale_x();
+                  probe_constants.height = source_rectangle.height_pixels * draw_resolution_scale_y();
+                  if (!probe_constants.width || !probe_constants.height) continue;
+                  command_list.D3DSetComputeRoot32BitConstants(
+                      2, sizeof(probe_constants) / sizeof(uint32_t), &probe_constants, 0);
+                  const uint32_t group_size = nb::gpu::kNbStencilProbeGroupSize;
+                  command_list.D3DDispatch((probe_constants.width + group_size - 1) / group_size,
+                                           (probe_constants.height + group_size - 1) / group_size, 1);
+                }
+              }
+            }
+          }
+          command_processor_.PushTransitionBarrier(nb_predication.predicates,
+                                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                   D3D12_RESOURCE_STATE_PREDICATION);
+          nb_predication.predicates_state = D3D12_RESOURCE_STATE_PREDICATION;
+          // Back to the state the draw loop's late barriers expect, in the same batch.
+          nb_draw = 0;
+          for (auto it = current_transfer_invocations_.cbegin(); it != current_transfer_invocations_.cend();
+               ++it, ++nb_draw) {
+            auto it_first = it;
+            while (std::next(it) != current_transfer_invocations_.cend() &&
+                   it_first->CanBeMergedIntoOneDraw(*std::next(it))) {
+              ++it;
+            }
+            if (nb_predication.draw_slots[nb_draw] == UINT32_MAX) continue;
+            auto& probe_source = *static_cast<D3D12RenderTarget*>(it_first->transfer.source);
+            command_processor_.PushTransitionBarrier(
+                probe_source.resource(),
+                probe_source.SetResourceState(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+          }
+        } else {
+          nb_predication.draw_slots.clear();
+        }
+      }
+      size_t nb_predication_draw = 0;
+
       // Perform the transfers for the render target.
 
       if (!transfer_viewport_set) {
@@ -4685,6 +4944,11 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         assert_not_zero(transfer_rectangle_count);
         // Skip the merged transfers in the subsequent iterations.
         it = it_merged_last;
+        // nb: this draw's stencil-bit predicate slot, counted in the same merge order as the probes.
+        const uint32_t nb_predicate_slot = nb_predication_draw < nb_predication.draw_slots.size()
+                                               ? nb_predication.draw_slots[nb_predication_draw]
+                                               : UINT32_MAX;
+        ++nb_predication_draw;
 
         assert_not_null(it->transfer.source);
         auto& source_d3d12_rt = *static_cast<D3D12RenderTarget*>(it->transfer.source);
@@ -4953,7 +5217,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             is_stencil_bit ? "transfer_stencil_bits" : "transfer_color_depth",
             uint64_t(dest_rt_key.resource_format) | (uint64_t(dest_rt_key.msaa_samples) << 32) |
                 (uint64_t(dest_rt_key.is_depth) << 40), transfer_vertex_count,
-            uint64_t(transfer_shader_key.mode) | (uint64_t(nb_transfer_uses_stencil_coverage) << 8));
+            uint64_t(transfer_shader_key.mode) | (uint64_t(nb_transfer_uses_stencil_coverage) << 8) |
+                (uint64_t(is_stencil_bit && nb_predicate_slot != UINT32_MAX) << 9));
         for (uint32_t j = 0; j <= uint32_t(is_stencil_bit) * 7; ++j) {
           if (is_stencil_bit) {
             uint32_t transfer_stencil_bit = uint32_t(1) << j;
@@ -4963,7 +5228,16 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
                 sizeof(transfer_stencil_bit) / sizeof(uint32_t), &transfer_stencil_bit, 0);
           }
           command_processor_.SetExternalPipeline(transfer_pipelines[j]);
+          if (is_stencil_bit && nb_predicate_slot != UINT32_MAX) {
+            // Skipped when no source sample the draw reads has bit j: the pass would write nothing.
+            command_list.D3DSetPredication(nb_stencil_predication.predicates,
+                                           nb::gpu::NbStencilPredicateOffset(nb_predicate_slot, j),
+                                           D3D12_PREDICATION_OP_EQUAL_ZERO);
+          }
           command_list.D3DDrawInstanced(transfer_vertex_count, 1, 0, 0);
+        }
+        if (is_stencil_bit && nb_predicate_slot != UINT32_MAX) {
+          command_list.D3DSetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
         }
         // nb: the stencil check (NbStencilVerifyState), right after this draw's variant passes.
         if (nb_transfer_uses_stencil_coverage && nb_verify_stencil_coverage) {

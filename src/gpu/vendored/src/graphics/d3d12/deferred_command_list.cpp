@@ -78,7 +78,7 @@ bool DeferredCommandList::IsReadyForReplay() const noexcept {
     if (command_stream_used_ - offset < kCommandHeaderSizeElements) return false;
     const auto& header = *reinterpret_cast<const CommandHeader*>(command_stream_.data() + offset);
     if (header.command < Command::kD3DClearDepthStencilView ||
-        header.command > Command::kD3DSetNativeGraphicsConstantBufferViews) return false;
+        header.command > Command::kD3DSetPredication) return false;
     offset += kCommandHeaderSizeElements;
     if (header.arguments_size_elements > command_stream_used_ - offset) return false;
     if (header.command == Command::kSetPipelineStateHandle) {
@@ -105,7 +105,7 @@ bool DeferredCommandList::ResolvePipelineHandlesForReplay() noexcept {
     if (command_stream_used_ - offset < kCommandHeaderSizeElements) return false;
     auto& header = *reinterpret_cast<CommandHeader*>(command_stream_.data() + offset);
     if (header.command < Command::kD3DClearDepthStencilView ||
-        header.command > Command::kD3DSetNativeGraphicsConstantBufferViews) return false;
+        header.command > Command::kD3DSetPredication) return false;
     offset += kCommandHeaderSizeElements;
     if (header.arguments_size_elements > command_stream_used_ - offset) return false;
     if (header.command == Command::kSetPipelineStateHandle &&
@@ -327,6 +327,10 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
         if (args.write_pixel) {
           command_list->SetGraphicsRootConstantBufferView(4, args.pixel);
         }
+      } break;
+      case Command::kD3DSetPredication: {
+        const auto& args = *reinterpret_cast<const D3DSetPredicationArguments*>(stream);
+        command_list->SetPredication(args.buffer, args.aligned_buffer_offset, args.operation);
       } break;
       case Command::kSetDescriptorHeaps: {
         auto& args = *reinterpret_cast<const SetDescriptorHeapsArguments*>(stream);
