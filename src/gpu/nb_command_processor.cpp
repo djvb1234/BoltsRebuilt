@@ -43,6 +43,7 @@
 #include "native/native_texture_descriptor_memo.h"
 #include "native/native_texture_outdated_poll.h"
 #include "native/native_wait_poll.h"
+#include "native/native_vblank_pacing.h"
 #include "native/native_translation_lookup_memo.h"
 
 #if NB_HAS_RUNTIME_WATCH_CONTROL
@@ -58,6 +59,7 @@ REXCVAR_DECLARE(bool, nb_native_constant_reuse);
 REXCVAR_DECLARE(bool, nb_native_unused_pixel_constants);
 REXCVAR_DECLARE(bool, nb_native_texture_outdated_load_first);
 REXCVAR_DECLARE(int32_t, nb_native_wait_spin_us);
+REXCVAR_DECLARE(bool, nb_vblank_precise_timer);
 REXCVAR_DECLARE(bool, nb_native_wait_target_diagnostics);
 REXCVAR_DECLARE(bool, nb_native_register_fastpath);
 REXCVAR_DECLARE(bool, nb_native_hardware_indices);
@@ -338,6 +340,7 @@ AssetBenchmarkPhase AssetPhaseForFrame(uint64_t frame) {
   // 17592186044416 re-reads blocked WAIT_REG_MEM predicates at yield cadence for up to 5 ms.
   // 35184372088832 draws alpha-test-free native pixel shaders when the alpha test cannot discard.
   // 70368744177664 skips render-target claims that the ownership map already satisfies.
+  // 4503599627370496 wakes the guest vblank thread when each vblank is due instead of polling at 1 ms.
   if (offset / length >= (perf_start > 0 ? PerfBenchmarkOptions().size() : std::size(modes))) return phase;
   phase.window = int(offset / length);
   if (perf_start > 0) phase.options = PerfBenchmarkOptions()[phase.window];
@@ -392,6 +395,7 @@ int64_t CurrentPerfOptions() {
          (REXCVAR_GET(nb_native_wait_spin_us) > 0 ? 17592186044416LL : 0) |
          (REXCVAR_GET(nb_native_alpha_test_variant) ? 35184372088832LL : 0) |
          (REXCVAR_GET(nb_rt_ownership_fastpath) ? 70368744177664LL : 0) |
+         (REXCVAR_GET(nb_vblank_precise_timer) ? 4503599627370496LL : 0) |
          (REXCVAR_GET(nb_native_replay_chunk_draws) >= 2048 ? 2199023255552LL :
           REXCVAR_GET(nb_native_replay_chunk_draws) > 0 ? 1099511627776LL : 0)
 #if NB_HAS_RUNTIME_WATCH_CONTROL
@@ -442,6 +446,7 @@ void ApplyPerfOptions(int64_t options) {
   REXCVAR_SET(nb_native_wait_spin_us, (options & 17592186044416LL) ? 5000 : 0);
   REXCVAR_SET(nb_native_alpha_test_variant, (options & 35184372088832LL) != 0);
   REXCVAR_SET(nb_rt_ownership_fastpath, (options & 70368744177664LL) != 0);
+  REXCVAR_SET(nb_vblank_precise_timer, (options & 4503599627370496LL) != 0);
   REXCVAR_SET(nb_native_replay_chunk_draws, (options & 2199023255552LL) ? 2048 :
                                         (options & 1099511627776LL) ? 1024 : 0);
 #if NB_HAS_RUNTIME_WATCH_CONTROL
@@ -902,6 +907,14 @@ void NbCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
     const auto& spins = nb::gpu::GetNativeWaitSpinStats();
     REXLOG_INFO("rexgpu-nb:   command wait spins cumulative: {} packets / {} yields / {} matched / {} budget exhausted",
                 spins.spinning_packets, spins.yields, spins.matched_while_spinning, spins.budget_exhausted);
+    const auto& vblanks = nb::gpu::GetNativeVblankStats();
+    REXLOG_INFO("rexgpu-nb:   guest vblanks cumulative: {} marked / {} late ns / {} max late ns / {} over 1 ms, "
+                "{} precise waits / {} fallbacks",
+                vblanks.marked.load(std::memory_order_relaxed), vblanks.late_ns.load(std::memory_order_relaxed),
+                vblanks.max_late_ns.load(std::memory_order_relaxed),
+                vblanks.late_over_1ms.load(std::memory_order_relaxed),
+                vblanks.precise_waits.load(std::memory_order_relaxed),
+                vblanks.precise_fallbacks.load(std::memory_order_relaxed));
     if (REXCVAR_GET(nb_native_wait_target_diagnostics)) {
       const auto& targets = nb::gpu::GetNativeWaitTargetTable();
       for (const auto& target : targets) {

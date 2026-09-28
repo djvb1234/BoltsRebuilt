@@ -20,7 +20,7 @@ set(NB_GPU_SDK_SOURCES
     ${NB_SDK_GRAPHICS}/sampler_info.cpp
 
     # GPU system
-    ${NB_SDK_GRAPHICS}/graphics_system.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendored/src/graphics/graphics_system.cpp            # vendored: optional precise vblank pacing
     ${CMAKE_CURRENT_SOURCE_DIR}/vendored/src/graphics/command_processor.cpp          # vendored: tile-pass counter
     ${CMAKE_CURRENT_SOURCE_DIR}/vendored/src/graphics/util/draw_extent_estimator.cpp  # vendored: guards on the vertex extent estimate
     ${NB_SDK_GRAPHICS}/util/draw.cpp
