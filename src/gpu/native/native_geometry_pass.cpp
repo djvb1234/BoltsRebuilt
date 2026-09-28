@@ -363,6 +363,7 @@ NativeGeometryPass::Timings g_timings;
 NativeGeometryPass::ConstantReuseStats g_constant_reuse_stats;
 NativeGeometryPass::IndexDrawStats g_index_draw_stats;
 NativeGeometryPass::PipelineKeyStats g_pipeline_key_stats;
+uint64_t g_record_refusals[NativeGeometryPass::kRecordRefusedCount] = {};
 // No-alpha-test pipeline creations in flight across all passes (NativeNoAlphaTestPipelineAdmitted):
 // counted from queueing on the command processor thread until CreateGraphicsPipelineState returns on
 // the worker. Not until the pass reaps the result: a pass that is never drawn again never reaps.
@@ -380,6 +381,8 @@ const NativeGeometryPass::IndexDrawStats& NativeGeometryPass::index_draw_stats()
 const NativeGeometryPass::PipelineKeyStats& NativeGeometryPass::pipeline_key_stats() {
   return g_pipeline_key_stats;
 }
+
+const uint64_t* NativeGeometryPass::record_refusals() { return g_record_refusals; }
 
 const char* NativeGeometryPass::kCommonHlsl() { return kNativePreludeHlsl; }
 
@@ -676,12 +679,16 @@ ID3D12PipelineState* NativeGeometryPass::GetPipeline(const D3D12CommandProcessor
     if (reuse && it->second) {
       ready_pipeline_reuse_.Publish(key.words, reinterpret_cast<uintptr_t>(it->second.Get()));
     }
+    if (!it->second) pipeline_miss_ = kRecordRefusedPipelineKnownBad;
     return it->second.Get();
   }
   if (pending_pipelines_.find(key) != pending_pipelines_.end()) {
     if (normalize_key) ++g_pipeline_key_stats.pending_hits;
+    pipeline_miss_ = kRecordRefusedPipelinePending;
     return nullptr;  // already being built; this draw stays emulated
   }
+  // CreatePipeline narrows this to known-bad or throttled when it does not queue.
+  pipeline_miss_ = kRecordRefusedPipelinePending;
   return CreatePipeline(key, context, state, root_cbv, false, normalize_key);
 }
 
@@ -798,6 +805,7 @@ ID3D12PipelineState* NativeGeometryPass::CreatePipeline(const PipelineKey& key,
   // to the emulated path, which drops it the same way).
   if (su.cull_front && su.cull_back) {
     pipelines_.emplace(key, nullptr);
+    if (!no_alpha_test) pipeline_miss_ = kRecordRefusedPipelineKnownBad;
     return nullptr;
   }
   desc.RasterizerState.CullMode = su.cull_front ? D3D12_CULL_MODE_FRONT
@@ -859,6 +867,7 @@ ID3D12PipelineState* NativeGeometryPass::CreatePipeline(const PipelineKey& key,
           ? !NativeNoAlphaTestPipelineAdmitted(pending_pipelines_.size(),
                                                g_no_alpha_test_pipelines_in_flight.load(std::memory_order_relaxed))
           : !NativeBaseSlotFree(pending_pipelines_.size(), no_alpha_test_pending_, MaxPipelinesInFlight())) {
+    if (!no_alpha_test) pipeline_miss_ = kRecordRefusedPipelineThrottled;
     return nullptr;  // a base draw stays emulated until a slot frees up; a variant keeps the base pipeline
   }
   const bool cull_front = su.cull_front != 0;
@@ -958,6 +967,26 @@ void NativeGeometryPass::ReapPipelines() {
   }
 }
 
+bool NativeGeometryPass::RefusesBeforeWork(const DrawArgs& args) {
+  bool refused = false;
+  // Compile-time elimination is valid only when the original vertex packet
+  // retains all-zero asset bindings. Guard before any resource or command work.
+  if (direct_guest_reads_ && args.asset_cache) {
+    ++g_constant_reuse_stats.direct_guest_refusals;
+    refused = true;
+  } else if (!initialized_ || args.host_vertex_count == 0) {
+    refused = true;
+  } else {
+    const bool empty_layouts = REXCVAR_GET(nb_native_empty_constant_layout);
+    const bool request_empty_vs = empty_layouts && args.vs_has_packed_layout && !args.vs_constant_count;
+    const bool request_empty_ps = empty_layouts && args.ps_has_packed_layout && !args.ps_constant_count;
+    refused = (request_empty_vs && args.vs_constant_run_count) || (request_empty_ps && args.ps_constant_run_count) ||
+              (REXCVAR_GET(nb_native_root_cbv) ? root_cbv_signature_.Get() : root_signature_.Get()) == nullptr;
+  }
+  if (refused) ++g_record_refusals[kRecordRefusedPassState];
+  return refused;
+}
+
 bool NativeGeometryPass::Record(D3D12CommandProcessor& cp, const D3D12CommandProcessor::NativeDrawContext& context,
                                 const GuestState& guest_state, const RootConstants& constants, const DrawArgs& args,
                                 bool* no_alpha_test_used) {
@@ -970,13 +999,7 @@ bool NativeGeometryPass::Record(D3D12CommandProcessor& cp, const D3D12CommandPro
   NativeVertexPacketDiagnostics::Attempt vertex_packet_attempt(
       vertex_packet_diagnostics_, observe_vertex_packet, vertex_packet_eligible,
       g_constant_reuse_stats.vs_packet_bypasses);
-  // Compile-time elimination is valid only when the original vertex packet
-  // retains all-zero asset bindings. Guard before any resource or command work.
-  if (direct_guest_reads_ && args.asset_cache) {
-    ++g_constant_reuse_stats.direct_guest_refusals;
-    return false;
-  }
-  if (!initialized_ || args.host_vertex_count == 0) {
+  if (RefusesBeforeWork(args)) {
     return false;
   }
   // Snapshot once for every stage/packet path. Missing metadata and handwritten
@@ -985,7 +1008,6 @@ bool NativeGeometryPass::Record(D3D12CommandProcessor& cp, const D3D12CommandPro
   const bool empty_layouts = REXCVAR_GET(nb_native_empty_constant_layout);
   const bool request_empty_vs = empty_layouts && args.vs_has_packed_layout && !args.vs_constant_count;
   const bool request_empty_ps = empty_layouts && args.ps_has_packed_layout && !args.ps_constant_count;
-  if ((request_empty_vs && args.vs_constant_run_count) || (request_empty_ps && args.ps_constant_run_count)) return false;
   const bool empty_vs = request_empty_vs && empty_vertex_buffer_safe_;
   const bool empty_ps = request_empty_ps && empty_pixel_buffer_safe_;
   g_constant_reuse_stats.empty_layout_bypasses +=
@@ -998,9 +1020,6 @@ bool NativeGeometryPass::Record(D3D12CommandProcessor& cp, const D3D12CommandPro
   const bool root_cbv = REXCVAR_GET(nb_native_root_cbv);
   const bool constant_binding_packet = root_cbv && REXCVAR_GET(nb_native_constant_binding_packet);
   ID3D12RootSignature* draw_root_signature = root_cbv ? root_cbv_signature_.Get() : root_signature_.Get();
-  if (!draw_root_signature) {
-    return false;
-  }
   auto stage_start = NativeTimingStart(detailed);
   // A draw asking for the pixel shader without AlphaTest makes one lookup for its pipeline, which never
   // creates anything. Unless that pipeline is ready the draw takes the base pipeline exactly as with the
@@ -1025,6 +1044,7 @@ bool NativeGeometryPass::Record(D3D12CommandProcessor& cp, const D3D12CommandPro
   }
   g_timings.pipeline_ns += NativeTimingElapsed(detailed, stage_start);
   if (!pipeline) {
+    ++g_record_refusals[pipeline_miss_];
     return false;
   }
   stage_start = NativeTimingStart(detailed);
@@ -1032,6 +1052,7 @@ bool NativeGeometryPass::Record(D3D12CommandProcessor& cp, const D3D12CommandPro
   if (args.sampler_slot_count) {
     uint32_t indices[kTextureSlots];
     if (!cp.RequestSamplerBindlessIndices(args.sampler_parameters, args.sampler_slot_count, indices)) {
+      ++g_record_refusals[kRecordRefusedSamplerHeap];
       return false;
     }
     for (uint32_t i = 0; i < args.sampler_slot_count; ++i) {
@@ -1260,6 +1281,7 @@ bool NativeGeometryPass::Record(D3D12CommandProcessor& cp, const D3D12CommandPro
   };
   if (!upload_stage(args.vs_constants, args.vs_constant_runs, args.vs_constant_run_count,
                     args.vs_constant_count, empty_vs, true, cb_address[0])) {
+    ++g_record_refusals[kRecordRefusedConstantSlice];
     return false;
   }
   cb_address[1] = alias_unused_pixel ? cb_address[0] :
@@ -1277,6 +1299,7 @@ bool NativeGeometryPass::Record(D3D12CommandProcessor& cp, const D3D12CommandPro
     }
   } else if (!upload_stage(args.ps_constants, args.ps_constant_runs, args.ps_constant_run_count,
                            args.ps_constant_count, empty_ps, false, cb_address[1])) {
+    ++g_record_refusals[kRecordRefusedConstantSlice];
     return false;
   }
 
@@ -1328,6 +1351,7 @@ bool NativeGeometryPass::Record(D3D12CommandProcessor& cp, const D3D12CommandPro
   }
   if (range_count != 0) {
     if (!shared_memory.RequestRanges(ranges, range_count)) {
+      ++g_record_refusals[kRecordRefusedResidency];
       return false;
     }
     // Only cache after the request succeeded, and fold in anything that was invalidated during the
@@ -1379,6 +1403,7 @@ bool NativeGeometryPass::Record(D3D12CommandProcessor& cp, const D3D12CommandPro
     uint8_t* memory = RequestConstantSlice(cp, args.constant_pool, cp.GetCurrentFrame(),
                                            sizeof(constants), &buffer, &offset, &root_cb_address, preparations);
     if (!memory) {
+      ++g_record_refusals[kRecordRefusedConstantSlice];
       return false;
     }
     // The pool keeps this frame's allocation alive until GPU completion. Write

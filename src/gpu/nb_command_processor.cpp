@@ -95,6 +95,11 @@ REXCVAR_DEFINE_BOOL(nb_native_minimal_command_diagnostics, true, "nb",
                     "Omit per-command shader/draw/copy and generic CPU clocks, so IssueDraw/generic and shader-load/copy "
                     "figures read 0; false restores them. Wall-frame and swap timing remain")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(nb_native_early_refusal, false, "nb",
+                    "Refuse native draws the generic pass cannot record before paying for their stream validation "
+                    "and texture bindings: unsupported primitive types first, and Record's pass-state refusals ahead "
+                    "of the texture walk. The same draws stay emulated; only the refusal counters can shift")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(nb_native_thread_cpu_diagnostics, false, "nb",
                     "Report cumulative command-thread CPU time at performance log boundaries without per-draw clocks")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -818,16 +823,30 @@ void NbCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
   if (phase_boundary || next_phase.mode != asset_cache_mode_ || native_before_keys != REXCVAR_GET(nb_native_generic) ||
       (phase.window < 0 && (f == 1 || f == 2 || f == 60 || (f % 600) == 0))) {
     REXLOG_INFO("rexgpu-nb: frame {}: {} draws ({} native), {} resolves, {} new shaders; frontbuffer {}x{} at 0x{:08X}; "
-                "CPU per frame over the last {}: IssueDraw {:.2f} ms (generic pass {:.2f} ms)",
+                "CPU per frame over the last {}: IssueDraw {:.2f} ms (generic pass {:.2f} ms, {:.2f} ms of it refused)",
                 f, draws_this_frame_, native_this_frame_, copies_this_frame_, shaders_this_frame_,
                 frontbuffer_width, frontbuffer_height, frontbuffer_ptr, frames_since_log_,
-                issue_draw_ns_ / 1.0e6 / double(frames_since_log_), generic_pass_ns_ / 1.0e6 / double(frames_since_log_));
+                issue_draw_ns_ / 1.0e6 / double(frames_since_log_), generic_pass_ns_ / 1.0e6 / double(frames_since_log_),
+                generic_refused_ns_ / 1.0e6 / double(frames_since_log_));
     REXLOG_INFO("rexgpu-nb:   generic pass refusals over the last {} frames: not in library {}, disabled {}, "
                 "not ready {}, unusable {}, prepare {}, texture unbound {}, sampler {}, record {}",
                 frames_since_log_, generic_refusals_[kRefusedNotInLibrary], generic_refusals_[kRefusedDisabled],
                 generic_refusals_[kRefusedNotReady], generic_refusals_[kRefusedUnusable],
                 generic_refusals_[kRefusedPrepare], generic_refusals_[kRefusedTexture],
                 generic_refusals_[kRefusedSampler], generic_refusals_[kRefusedRecord]);
+    {
+      // Record's refusals by stage, cumulative so they survive the periodic reset above.
+      const uint64_t* record = NativeGeometryPass::record_refusals();
+      REXLOG_INFO("rexgpu-nb:   native record refusals cumulative: pass state {}, pipeline pending {}, "
+                  "pipeline throttled {}, pipeline known bad {}, sampler heap {}, constant slice {}, residency {}",
+                  record[NativeGeometryPass::kRecordRefusedPassState],
+                  record[NativeGeometryPass::kRecordRefusedPipelinePending],
+                  record[NativeGeometryPass::kRecordRefusedPipelineThrottled],
+                  record[NativeGeometryPass::kRecordRefusedPipelineKnownBad],
+                  record[NativeGeometryPass::kRecordRefusedSamplerHeap],
+                  record[NativeGeometryPass::kRecordRefusedConstantSlice],
+                  record[NativeGeometryPass::kRecordRefusedResidency]);
+    }
     REXLOG_INFO("rexgpu-nb:   native draws using empty texture slots over the last {} frames: {}",
                 frames_since_log_, native_empty_texture_draws_);
     REXLOG_INFO("rexgpu-nb:   native triangle-strip draws over the last {} frames: {}",
@@ -1098,14 +1117,14 @@ void NbCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
     REXLOG_INFO("rexgpu-nb:   command CPU per frame: shader loads {:.3f} ms, copies {:.3f} ms, swaps {:.3f} ms (nested draw/copy costs overlap)",
                 shader_load_ns_ / 1.0e6 / frames, issue_copy_ns_ / 1.0e6 / frames, issue_swap_ns_ / 1.0e6 / frames);
     const auto snapshot_bytes = native_asset_cache_.stats().snapshot_bytes;
-    REXLOG_INFO("rexgpu-nb: perf: mode {} window {} phase {} frames {} fps {:.3f} frame_ms {:.3f} native_pct {:.3f} draws_per_frame {:.1f} IssueDraw_ms {:.3f} generic_ms {:.3f} residency_ms {:.3f} assets_ms {:.3f} snapshot_bytes_per_frame {:.1f}",
+    REXLOG_INFO("rexgpu-nb: perf: mode {} window {} phase {} frames {} fps {:.3f} frame_ms {:.3f} native_pct {:.3f} draws_per_frame {:.1f} IssueDraw_ms {:.3f} generic_ms {:.3f} residency_ms {:.3f} assets_ms {:.3f} snapshot_bytes_per_frame {:.1f} refused_ms {:.3f}",
                 asset_cache_mode_, phase.window, phase.name(), frames_since_log_,
                 frame_wall_ns_ ? double(interval_timed_frames_) * 1.0e9 / double(frame_wall_ns_) : 0.0,
                 interval_timed_frames_ ? double(frame_wall_ns_) / 1.0e6 / double(interval_timed_frames_) : 0.0,
                 interval_draws_ ? double(interval_native_draws_) * 100.0 / double(interval_draws_) : 0.0,
                 double(interval_draws_) / frames, issue_draw_ns_ / 1.0e6 / frames, generic_pass_ns_ / 1.0e6 / frames,
                 timings.residency_ns / 1.0e6 / frames, timings.asset_match_ns / 1.0e6 / frames,
-                double(snapshot_bytes - interval_snapshot_bytes_) / frames);
+                double(snapshot_bytes - interval_snapshot_bytes_) / frames, generic_refused_ns_ / 1.0e6 / frames);
     REXLOG_INFO("rexgpu-nb:   native draw CPU per frame: pipeline {:.2f} ms, constants {:.2f} ms, "
                 "RequestRange {:.2f} ms, assets {:.2f} ms, UseForReading {:.2f} ms, record {:.2f} ms, texture request {:.2f} ms, texture bindings {:.2f} ms; residency {} hit / {} miss, {} invalidations folded",
                 timings.pipeline_ns / 1.0e6 / frames,
@@ -1132,6 +1151,7 @@ void NbCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
     std::memset(texture_failure_dimensions_, 0, sizeof texture_failure_dimensions_);
     issue_draw_ns_ = 0;
     generic_pass_ns_ = 0;
+    generic_refused_ns_ = 0;
     shader_load_ns_ = 0;
     issue_copy_ns_ = 0;
     issue_swap_ns_ = 0;
@@ -1430,6 +1450,26 @@ bool NbCommandProcessor::TryBloomBlurPass(const NativeDrawContext& context) {
   return false;
 }
 
+namespace {
+
+// The primitive types and index modes PrepareGeometry's switch refuses, with its reasons.
+const char* NativePrimitiveRefusal(rex::graphics::xenos::PrimitiveType type, bool indexed) {
+  using rex::graphics::xenos::PrimitiveType;
+  switch (type) {
+    case PrimitiveType::kTriangleList:
+    case PrimitiveType::kPointList:
+      return nullptr;
+    case PrimitiveType::kTriangleStrip:
+      return indexed ? "indexed triangle strip" : nullptr;
+    case PrimitiveType::kQuadList:
+      return indexed ? "indexed quad list" : nullptr;
+    default:
+      return "unsupported primitive type";
+  }
+}
+
+}  // namespace
+
 bool NbCommandProcessor::PrepareGeometry(const NativeDrawContext& context, NativeGeometryPass::RootConstants& root,
                                          NativeGeometryPass::GuestState& state, NativeGeometryPass::DrawArgs& args,
                                          const std::vector<NativeShaderLibrary::Stream>* streams) {
@@ -1449,6 +1489,12 @@ bool NbCommandProcessor::PrepareGeometry(const NativeDrawContext& context, Nativ
   };
   root = NativeGeometryPass::RootConstants{};
   args = NativeGeometryPass::DrawArgs{};
+  // The primitive switch below refuses on the draw's type alone; ask it before validating streams.
+  if (REXCVAR_GET(nb_native_early_refusal)) {
+    if (const char* why = NativePrimitiveRefusal(context.guest_primitive_type, context.indexed)) {
+      return refuse(why);
+    }
+  }
   // Streams: a generated pass names its vertex fetch constants and the strides its vfetch instructions
   // carry; the hand-written passes take the guest vertex shader's first binding.
   NativeShaderLibrary::Stream first_binding{};
@@ -1645,7 +1691,9 @@ bool NbCommandProcessor::TryGenericPass(const NativeDrawContext& context) {
   const bool timed = !REXCVAR_GET(nb_native_minimal_command_diagnostics);
   const auto t0 = NativeTimingStart(timed);
   const bool result = TryGenericPassImpl(context);
-  generic_pass_ns_ += NativeTimingElapsed(timed, t0);
+  const uint64_t elapsed = NativeTimingElapsed(timed, t0);
+  generic_pass_ns_ += elapsed;
+  if (!result) generic_refused_ns_ += elapsed;
   return result;
 }
 
@@ -1718,6 +1766,26 @@ bool NbCommandProcessor::TryGenericPassImpl(const NativeDrawContext& context) {
   args.asset_cache = draw_asset_cache;
   args.legacy_asset_cache = asset_cache_mode_ == 1;
   args.constant_pool = ConstantUploadPool();
+  // The pair's constant layout, which Record's first refusals read; nothing below changes it.
+  args.vs_constant_runs = pair->vs->constant_runs.data();
+  args.vs_constant_run_count = pair->vs->constant_runs.size();
+  args.vs_constant_count = pair->vs->packed_constants;
+  args.vs_has_packed_layout = pair->vs->has_packed_layout;
+  if (pair->ps) {
+    args.ps_constant_runs = pair->ps->constant_runs.data();
+    args.ps_constant_run_count = pair->ps->constant_runs.size();
+    args.ps_constant_count = pair->ps->packed_constants;
+    args.ps_has_packed_layout = pair->ps->has_packed_layout;
+  } else {
+    args.ps_constants = nullptr;
+    args.ps_constant_count = 1;
+  }
+  // Record would refuse this draw before any lookup; say so now rather than after the texture walk.
+  if (REXCVAR_GET(nb_native_early_refusal) && pair->pass.RefusesBeforeWork(args)) {
+    pair->skips++;
+    generic_refusals_[kRefusedRecord]++;
+    return false;
+  }
 
   // Textures: the pixel shader's fetch constants occupy root-constant slots 0..15, the vertex shader's
   // 16..19, in the order the translated shader assigned them. Each slot also carries the sampler the
@@ -1959,19 +2027,6 @@ bool NbCommandProcessor::TryGenericPassImpl(const NativeDrawContext& context) {
         }
       }
     }
-  }
-  args.vs_constant_runs = pair->vs->constant_runs.data();
-  args.vs_constant_run_count = pair->vs->constant_runs.size();
-  args.vs_constant_count = pair->vs->packed_constants;
-  args.vs_has_packed_layout = pair->vs->has_packed_layout;
-  if (pair->ps) {
-    args.ps_constant_runs = pair->ps->constant_runs.data();
-    args.ps_constant_run_count = pair->ps->constant_runs.size();
-    args.ps_constant_count = pair->ps->packed_constants;
-    args.ps_has_packed_layout = pair->ps->has_packed_layout;
-  } else {
-    args.ps_constants = nullptr;
-    args.ps_constant_count = 1;
   }
   // nb_native_alpha_test_variant: when the alpha-test word this draw uploads cannot reach AlphaTest's
   // discard, and the draw writes depth or stencil where an early test could skip shading, ask for the
