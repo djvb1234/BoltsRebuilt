@@ -40,6 +40,14 @@
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+#include <d3dcompiler.h>
+#include <unordered_map>
+#include <vector>
+
+#include "nb_direct_resolve_sources.h"
+
+#pragma comment(lib, "d3dcompiler.lib")
+
 REXCVAR_DECLARE(bool, nb_native_static_bindings);
 
 REXCVAR_DEFINE_BOOL(native_stencil_value_output_d3d12_intel, false, "GPU/D3D12",
@@ -83,6 +91,13 @@ REXCVAR_DEFINE_STRING(nb_transfer_stencil_coverage_verify_frames, "", "nb",
                       "Diagnostic: in frames first-last, use the per-pixel stencil-bit passes and count with "
                       "occlusion queries whether they set exactly the SDK's stencil bits (one check per launch, "
                       "reported in the log; it adds GPU work, so never time inside it)");
+
+// nb: direct host render target resolve (direct_host_resolve, d3d12/direct_resolve/nb_direct_resolve.hlsl).
+REXCVAR_DEFINE_STRING(nb_direct_resolve_verify_frames, "", "nb",
+                      "Diagnostic: in frames first-last[,first-last...], resolve through the SDK's dump and copy "
+                      "and count whether the direct resolve would have stored exactly the same values (one check "
+                      "per launch, reported in the log; it adds GPU work, so never time inside it). While this "
+                      "is set, direct_host_resolve waits for a clean check and stays off after a difference");
 
 // NbCommandProcessor counts a frame at its swap (nb_command_processor.cpp), so the frame being recorded is
 // one past the completed count, which is the frame trace's numbering.
@@ -254,6 +269,369 @@ void NbStencilVerifyReport(bool window_active, uint64_t completed_submission) {
     key_list += text;
   }
   REXGPU_INFO("nb verify: checked draws per shader key (key:draws):{}", key_list);
+}
+
+// nb: direct host render target resolve (direct_host_resolve). D3D12RenderTargetCache::Resolve normally dumps
+// the render targets a resolve covers into the EDRAM buffer and then runs the copy shader over that buffer.
+// The direct path runs the same copy shader source with its EDRAM reads answered from the render target
+// through the dump's own conversion (d3d12/direct_resolve/nb_direct_resolve.hlsl), so the dump dispatch, its
+// full write of the EDRAM buffer and the barrier between the two passes are gone. It applies when exactly one
+// 32bpp color render target owns every tile the resolve reads; anything else keeps the dump.
+//
+// nb_direct_resolve_verify_frames runs the SDK's dump and copy and then the direct shader in a mode that only
+// compares what it would store with what the SDK stored, counting differences per resolve into a small buffer
+// that is read back after the window. One check per launch; the render target cache is a single instance.
+struct NbDirectResolveState {
+  static constexpr uint32_t kVerifySlots = 4096;
+  // At most this many checked resolves per pipeline, so a long window reaches rare ones before it is full.
+  static constexpr uint32_t kVerifySlotsPerPipeline = 256;
+  // What the current resolve reads, set by TryResolveCopyDirectly (a D3D12RenderTarget, which is private).
+  void* source = nullptr;
+  ID3D12PipelineState* pipeline = nullptr;
+  uint64_t pipeline_key = 0;
+  // Direct resolves are refused for the rest of the run after a check found a difference.
+  bool latched_off = false;
+  bool verify_unavailable = false;
+  bool verify_copy_recorded = false;
+  bool verify_reported = false;
+  bool verify_clean = false;
+  uint64_t verify_copy_submission = 0;
+  ID3D12Resource* verify_counters = nullptr;
+  ID3D12Resource* verify_readback = nullptr;
+  std::vector<uint64_t> verify_slot_keys;
+  std::unordered_map<uint64_t, ID3D12PipelineState*> verify_pipelines;
+  // Logged once each, so a run shows which resolves the direct path serves and why others keep the dump.
+  std::vector<uint64_t> logged_pipelines;
+  uint32_t logged_fallback_reasons = 0;
+};
+NbDirectResolveState nb_direct_resolve;
+
+enum NbDirectResolveFallback : uint32_t {
+  kNbDirectResolveFallbackDepth,
+  kNbDirectResolveFallback64bpp,
+  kNbDirectResolveFallbackCopyShader,
+  kNbDirectResolveFallbackOwnership,
+  kNbDirectResolveFallbackSourceFormat,
+  kNbDirectResolveFallbackPipeline,
+  kNbDirectResolveFallbackCount,
+};
+const char* const kNbDirectResolveFallbackNames[kNbDirectResolveFallbackCount] = {
+    "the resolve copies depth",
+    "the resolve source is 64bpp",
+    "the copy shader has no direct variant",
+    "not exactly one render target owns the resolved tiles",
+    "the owning render target's format has no direct variant (depth, 64bpp or 8_8_8_8_GAMMA)",
+    "the direct pipeline could not be created",
+};
+
+void NbDirectResolveNoteFallback(NbDirectResolveFallback reason) {
+  ++rex::graphics::GetPhase3Counters().direct_resolve_fallback_count;
+  uint32_t bit = uint32_t(1) << uint32_t(reason);
+  if (!(nb_direct_resolve.logged_fallback_reasons & bit)) {
+    nb_direct_resolve.logged_fallback_reasons |= bit;
+    REXGPU_INFO("nb direct resolve: keeping the dump for a resolve because {} (logged once per reason)",
+                kNbDirectResolveFallbackNames[reason]);
+  }
+}
+
+// The file of the copy shader in nb_direct_resolve.hlsl's list, or -1.
+int NbDirectResolveCopyShaderFile(rex::graphics::draw_util::ResolveCopyShaderIndex copy_shader) {
+  using rex::graphics::draw_util::ResolveCopyShaderIndex;
+  switch (copy_shader) {
+    case ResolveCopyShaderIndex::kFast32bpp1x2xMSAA:
+      return 0;
+    case ResolveCopyShaderIndex::kFast32bpp4xMSAA:
+      return 1;
+    case ResolveCopyShaderIndex::kFull8bpp:
+      return 2;
+    case ResolveCopyShaderIndex::kFull16bpp:
+      return 3;
+    case ResolveCopyShaderIndex::kFull32bpp:
+      return 4;
+    case ResolveCopyShaderIndex::kFull64bpp:
+      return 5;
+    case ResolveCopyShaderIndex::kFull128bpp:
+      return 6;
+    default:
+      return -1;
+  }
+}
+
+// Whether the dump shader's conversion of this color format is reproduced by nb_direct_resolve.hlsl.
+bool NbDirectResolveSourceFormatSupported(rex::graphics::xenos::ColorRenderTargetFormat format) {
+  using rex::graphics::xenos::ColorRenderTargetFormat;
+  switch (format) {
+    case ColorRenderTargetFormat::k_8_8_8_8:
+    case ColorRenderTargetFormat::k_2_10_10_10:
+    case ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
+    case ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
+    case ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
+    case ColorRenderTargetFormat::k_16_16:
+    case ColorRenderTargetFormat::k_16_16_FLOAT:
+    case ColorRenderTargetFormat::k_32_FLOAT:
+      return true;
+    default:
+      // 8_8_8_8_GAMMA converts through the PWL gamma curve in the dump; depth and 64bpp are not handled.
+      return false;
+  }
+}
+
+// Serves nb_direct_resolve.hlsl and the Xenia sources it includes from the copies embedded at build time.
+// The Xenia files include each other through relative paths; only the file name is looked up.
+class NbDirectResolveInclude final : public ID3DInclude {
+ public:
+  HRESULT __stdcall Open(D3D_INCLUDE_TYPE, LPCSTR file_name, LPCVOID, LPCVOID* data_out,
+                         UINT* bytes_out) override {
+    std::string_view name(file_name);
+    size_t slash = name.find_last_of("/\\");
+    if (slash != std::string_view::npos) {
+      name.remove_prefix(slash + 1);
+    }
+    for (const nb::gpu::direct_resolve_sources::File& file : nb::gpu::direct_resolve_sources::kFiles) {
+      if (name == file.name) {
+        *data_out = file.data;
+        *bytes_out = UINT(file.size);
+        return S_OK;
+      }
+    }
+    return E_FAIL;
+  }
+  HRESULT __stdcall Close(LPCVOID) override { return S_OK; }
+};
+
+struct NbDirectResolveShaderOptions {
+  int copy_shader_file;
+  uint32_t source_format;
+  bool source_is_uint;
+  uint32_t source_msaa_samples;
+  bool resolution_scaled;
+  uint32_t scale_x, scale_y;
+  uint32_t host_sample_2x[2];
+  bool verify;
+};
+
+ID3D12PipelineState* NbCreateDirectResolvePipeline(ID3D12Device* device, ID3D12RootSignature* root_signature,
+                                                   const NbDirectResolveShaderOptions& options) {
+  const nb::gpu::direct_resolve_sources::File* main_file = nullptr;
+  for (const nb::gpu::direct_resolve_sources::File& file : nb::gpu::direct_resolve_sources::kFiles) {
+    if (std::string_view(file.name) == "nb_direct_resolve.hlsl") {
+      main_file = &file;
+    }
+  }
+  if (!main_file) {
+    return nullptr;
+  }
+  std::string values[9] = {
+      std::to_string(options.copy_shader_file), std::to_string(options.source_format),
+      std::to_string(uint32_t(options.source_is_uint)), std::to_string(options.source_msaa_samples),
+      std::to_string(options.scale_x), std::to_string(options.scale_y),
+      std::to_string(options.host_sample_2x[0]), std::to_string(options.host_sample_2x[1]), "1"};
+  std::vector<D3D_SHADER_MACRO> macros = {
+      {"SHADING_LANGUAGE_HLSL_XE", "1"},
+      {"NB_DIRECT_RESOLVE_COPY_SHADER", values[0].c_str()},
+      {"NB_DIRECT_RESOLVE_SOURCE_FORMAT", values[1].c_str()},
+      {"NB_DIRECT_RESOLVE_SOURCE_IS_UINT", values[2].c_str()},
+      {"NB_DIRECT_RESOLVE_SOURCE_MSAA", values[3].c_str()},
+      {"NB_DIRECT_RESOLVE_SCALE_X", values[4].c_str()},
+      {"NB_DIRECT_RESOLVE_SCALE_Y", values[5].c_str()},
+      {"NB_DIRECT_RESOLVE_2X_HOST_SAMPLE_0", values[6].c_str()},
+      {"NB_DIRECT_RESOLVE_2X_HOST_SAMPLE_1", values[7].c_str()},
+  };
+  if (options.resolution_scaled) {
+    macros.push_back({"XE_RESOLVE_RESOLUTION_SCALED", values[8].c_str()});
+  }
+  if (options.verify) {
+    macros.push_back({"NB_DIRECT_RESOLVE_VERIFY", values[8].c_str()});
+  }
+  macros.push_back({nullptr, nullptr});
+  NbDirectResolveInclude include;
+  ID3DBlob* code = nullptr;
+  ID3DBlob* errors = nullptr;
+  // No flags, as Xenia's build compiled the precompiled resolve shaders (fxc with default optimization).
+  HRESULT result = D3DCompile(main_file->data, main_file->size, "nb_direct_resolve.hlsl", macros.data(),
+                              &include, "main", "cs_5_1", 0, 0, &code, &errors);
+  if (FAILED(result) || !code) {
+    REXGPU_ERROR("nb direct resolve: compiling copy shader {} for format {} at {}x MSAA{} failed: {}",
+                 options.copy_shader_file, options.source_format, 1u << options.source_msaa_samples,
+                 options.verify ? " (check)" : "",
+                 errors ? std::string_view(static_cast<const char*>(errors->GetBufferPointer()),
+                                           errors->GetBufferSize())
+                        : std::string_view("no compiler output"));
+    if (errors) {
+      errors->Release();
+    }
+    if (code) {
+      code->Release();
+    }
+    return nullptr;
+  }
+  if (errors) {
+    errors->Release();
+  }
+  ID3D12PipelineState* pipeline = rex::ui::d3d12::util::CreateComputePipeline(
+      device, code->GetBufferPointer(), code->GetBufferSize(), root_signature);
+  code->Release();
+  if (pipeline) {
+    std::u16string pipeline_name = rex::string::to_utf16(
+        fmt::format("NB Direct Resolve {} fmt {} {}xMSAA{}", options.copy_shader_file, options.source_format,
+                    1u << options.source_msaa_samples, options.verify ? " Check" : ""));
+    pipeline->SetName(reinterpret_cast<LPCWSTR>(pipeline_name.c_str()));
+  }
+  return pipeline;
+}
+
+void NbDirectResolveRelease() {
+  NbDirectResolveState& d = nb_direct_resolve;
+  for (const auto& pipeline_pair : d.verify_pipelines) {
+    if (pipeline_pair.second) {
+      pipeline_pair.second->Release();
+    }
+  }
+  d.verify_pipelines.clear();
+  if (d.verify_counters) {
+    d.verify_counters->Release();
+    d.verify_counters = nullptr;
+  }
+  if (d.verify_readback) {
+    d.verify_readback->Release();
+    d.verify_readback = nullptr;
+  }
+  d.verify_slot_keys.clear();
+  d.source = nullptr;
+  d.pipeline = nullptr;
+}
+
+// Gives the next check's counter slot, or false when the check cannot take another resolve of this pipeline.
+bool NbDirectResolveVerifyReserve(ID3D12Device* device, uint64_t pipeline_key, uint32_t* slot) {
+  NbDirectResolveState& d = nb_direct_resolve;
+  if (d.verify_unavailable || d.verify_copy_recorded ||
+      d.verify_slot_keys.size() >= NbDirectResolveState::kVerifySlots) {
+    return false;
+  }
+  if (std::count(d.verify_slot_keys.begin(), d.verify_slot_keys.end(), pipeline_key) >=
+      NbDirectResolveState::kVerifySlotsPerPipeline) {
+    return false;
+  }
+  if (!d.verify_counters) {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
+        !options.TypedUAVLoadAdditionalFormats) {
+      REXGPU_ERROR("nb direct resolve check: the GPU cannot load R32G32B32A32_UINT UAVs; nothing was checked");
+      d.verify_unavailable = true;
+      return false;
+    }
+    D3D12_RESOURCE_DESC buffer_desc = {};
+    buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer_desc.Width = uint64_t(NbDirectResolveState::kVerifySlots) * 2 * sizeof(uint32_t);
+    buffer_desc.Height = 1;
+    buffer_desc.DepthOrArraySize = 1;
+    buffer_desc.MipLevels = 1;
+    buffer_desc.SampleDesc.Count = 1;
+    buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES readback_heap = {};
+    readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_HEAP_PROPERTIES default_heap = {};
+    default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC counters_desc = buffer_desc;
+    counters_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    // Buffers in a default heap are created zeroed.
+    if (FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &counters_desc,
+                                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                               IID_PPV_ARGS(&d.verify_counters))) ||
+        FAILED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               IID_PPV_ARGS(&d.verify_readback)))) {
+      REXGPU_ERROR("nb direct resolve check: could not create its counters; nothing was checked");
+      NbDirectResolveRelease();
+      d.verify_unavailable = true;
+      return false;
+    }
+  }
+  *slot = uint32_t(d.verify_slot_keys.size());
+  d.verify_slot_keys.push_back(pipeline_key);
+  return true;
+}
+
+// Once the window has ended (or the check is full), copies the counters for readback, and once that copy has
+// completed on the GPU, logs the result. A difference turns the direct resolve off for the rest of the run.
+void NbDirectResolveVerifyPoll(rex::graphics::d3d12::D3D12CommandProcessor& command_processor,
+                               bool window_active) {
+  NbDirectResolveState& d = nb_direct_resolve;
+  if (d.verify_reported || d.verify_slot_keys.empty()) {
+    return;
+  }
+  if (!d.verify_copy_recorded) {
+    if (window_active && d.verify_slot_keys.size() < NbDirectResolveState::kVerifySlots) {
+      return;
+    }
+    rex::graphics::d3d12::DeferredCommandList& command_list = command_processor.GetDeferredCommandList();
+    command_processor.PushTransitionBarrier(d.verify_counters, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                            D3D12_RESOURCE_STATE_COPY_SOURCE);
+    command_processor.SubmitBarriers();
+    command_list.D3DCopyBufferRegion(d.verify_readback, 0, d.verify_counters, 0,
+                                     uint64_t(d.verify_slot_keys.size()) * 2 * sizeof(uint32_t));
+    command_processor.PushTransitionBarrier(d.verify_counters, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    d.verify_copy_recorded = true;
+    d.verify_copy_submission = command_processor.GetCurrentSubmission();
+    return;
+  }
+  if (command_processor.GetCompletedSubmission() < d.verify_copy_submission) {
+    return;
+  }
+  d.verify_reported = true;
+  const size_t bytes = d.verify_slot_keys.size() * 2 * sizeof(uint32_t);
+  D3D12_RANGE read_range = {0, bytes};
+  void* mapping = nullptr;
+  if (FAILED(d.verify_readback->Map(0, &read_range, &mapping))) {
+    REXGPU_ERROR("nb direct resolve check: could not map its counters; nothing was checked, direct resolve off");
+    d.latched_off = true;
+    return;
+  }
+  const uint32_t* counters = static_cast<const uint32_t*>(mapping);
+  struct PipelineTotals {
+    uint64_t key;
+    uint32_t resolves = 0, differing_resolves = 0;
+    uint64_t stores = 0, differing_stores = 0;
+  };
+  std::vector<PipelineTotals> totals;
+  uint64_t stores = 0, differing_stores = 0;
+  uint32_t differing_resolves = 0, empty_resolves = 0;
+  for (size_t i = 0; i < d.verify_slot_keys.size(); ++i) {
+    uint32_t slot_differences = counters[i * 2], slot_stores = counters[i * 2 + 1];
+    auto it = std::find_if(totals.begin(), totals.end(),
+                           [&](const PipelineTotals& t) { return t.key == d.verify_slot_keys[i]; });
+    if (it == totals.end()) {
+      totals.push_back({d.verify_slot_keys[i]});
+      it = std::prev(totals.end());
+    }
+    ++it->resolves;
+    it->stores += slot_stores;
+    it->differing_stores += slot_differences;
+    it->differing_resolves += uint32_t(slot_differences != 0);
+    stores += slot_stores;
+    differing_stores += slot_differences;
+    differing_resolves += uint32_t(slot_differences != 0);
+    empty_resolves += uint32_t(slot_stores == 0);
+  }
+  D3D12_RANGE written_range = {0, 0};
+  d.verify_readback->Unmap(0, &written_range);
+  // A resolve whose check stored nothing means the check did not run as intended, so it cannot pass.
+  d.verify_clean = !differing_stores && !empty_resolves;
+  for (const PipelineTotals& t : totals) {
+    REXGPU_INFO("nb direct resolve check: pipeline {:011X}: {} resolves, {} stores compared, {} differ in {} "
+                "resolves",
+                t.key, t.resolves, t.stores, t.differing_stores, t.differing_resolves);
+  }
+  if (d.verify_clean) {
+    REXGPU_INFO("nb direct resolve check: PASSED, {} resolves and {} stores identical to the SDK's dump and copy",
+                d.verify_slot_keys.size(), stores);
+  } else {
+    d.latched_off = true;
+    REXGPU_ERROR("nb direct resolve check: FAILED, {} of {} stores differ in {} of {} resolves ({} resolves "
+                 "compared nothing); direct_host_resolve is off for the rest of this run",
+                 differing_stores, stores, differing_resolves, d.verify_slot_keys.size(), empty_resolves);
+  }
 }
 
 }  // namespace
@@ -552,11 +930,34 @@ bool D3D12RenderTargetCache::Initialize() {
     Shutdown();
     return false;
   }
-  // Direct resolve currently shares the root signature shape with the resolve
-  // copy pass (constants + destination UAV + source SRV) and may diverge later.
-  direct_resolve_root_signature_color_ = resolve_copy_root_signature_;
+  // nb: the direct resolve (nb_direct_resolve.hlsl) takes the resolve copy's parameters, with the render target
+  // as the source SRV, plus its own constants at b1 and, for the check, a counter buffer at u1. Without it the
+  // direct resolve is unavailable and every resolve keeps the dump. Depth is never resolved directly; the depth
+  // member keeps upstream's alias.
+  {
+    std::array<D3D12_ROOT_PARAMETER, 5> direct_root_parameters;
+    direct_root_parameters[0] = resolve_copy_root_parameters[0];
+    direct_root_parameters[1] = resolve_copy_root_parameters[1];
+    direct_root_parameters[2] = resolve_copy_root_parameters[2];
+    direct_root_parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    direct_root_parameters[3].Constants.ShaderRegister = 1;
+    direct_root_parameters[3].Constants.RegisterSpace = 0;
+    direct_root_parameters[3].Constants.Num32BitValues = 2;
+    direct_root_parameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    direct_root_parameters[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    direct_root_parameters[4].Descriptor.ShaderRegister = 1;
+    direct_root_parameters[4].Descriptor.RegisterSpace = 0;
+    direct_root_parameters[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC direct_root_signature_desc = resolve_copy_root_signature_desc;
+    direct_root_signature_desc.NumParameters = UINT(direct_root_parameters.size());
+    direct_root_signature_desc.pParameters = direct_root_parameters.data();
+    direct_resolve_root_signature_color_ =
+        ui::d3d12::util::CreateRootSignature(provider, direct_root_signature_desc);
+    if (direct_resolve_root_signature_color_ == nullptr) {
+      REXGPU_ERROR("nb direct resolve: could not create the root signature; every resolve keeps the dump");
+    }
+  }
   direct_resolve_root_signature_depth_ = resolve_copy_root_signature_;
-  direct_resolve_root_signature_color_->AddRef();
   direct_resolve_root_signature_depth_->AddRef();
 
   // Create the resolve copying pipelines.
@@ -1182,6 +1583,7 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
   // nb: withdraw the draw extent estimate's GPU-written query registered in Initialize.
   SetDrawExtentGpuWrittenQuery(nullptr, nullptr);
   NbStencilVerifyRelease();
+  NbDirectResolveRelease();
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_64bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_32bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_root_signature_);
@@ -1421,12 +1823,31 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           uint64_t(copy_shader_info.source_bpe_log2) | (uint64_t(copy_shader_info.dest_bpe_log2) << 8) |
               (uint64_t(copy_shader_info.source_is_raw) << 16), resolve_info.copy_dest_extent_length);
       bool direct_resolved = false;
+      // nb: the direct resolve check re-reads the resolve through the direct shader after the SDK's copy.
+      bool direct_verify = false;
+      uint32_t direct_verify_slot = 0;
       if (GetPath() == Path::kHostRenderTargets) {
-        if (REXCVAR_GET(direct_host_resolve)) {
-          direct_resolved =
-              TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
+        const std::string& verify_frames = REXCVAR_GET(nb_direct_resolve_verify_frames);
+        bool verify_window = NbFrameInWindows(verify_frames);
+        NbDirectResolveVerifyPoll(command_processor_, verify_window);
+        // With a check configured, the direct path waits for it to pass.
+        bool use_direct = REXCVAR_GET(direct_host_resolve) && !nb_direct_resolve.latched_off &&
+                          (verify_frames.empty() || nb_direct_resolve.verify_clean);
+        bool check = verify_window && !nb_direct_resolve.verify_copy_recorded &&
+                     !nb_direct_resolve.verify_unavailable && !nb_direct_resolve.latched_off;
+        if (use_direct || check) {
+          if (TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled)) {
+            if (check) {
+              direct_verify = NbDirectResolveVerifyReserve(
+                  command_processor_.GetD3D12Provider().GetDevice(), nb_direct_resolve.pipeline_key,
+                  &direct_verify_slot);
+            } else {
+              direct_resolved = true;
+            }
+          }
           if (direct_resolved) {
             ++direct_resolve_success_count_;
+            ++GetPhase3Counters().direct_resolve_count;
           } else {
             ++direct_resolve_fallback_count_;
           }
@@ -1471,9 +1892,15 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
         // (D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP).
         ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_dest;
         ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_source;
-        ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[2];
-        if (command_processor_.RequestOneUseSingleViewDescriptors(
-                bindless_resources_used_ ? uint32_t(draw_resolution_scaled) : 2, descriptors)) {
+        // nb: one more for the render target when the direct shader reads it, requested in the same call so
+        // that all of them are in the same heap.
+        ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[3];
+        uint32_t descriptor_count = bindless_resources_used_ ? uint32_t(draw_resolution_scaled) : 2;
+        uint32_t descriptor_index_direct_source = descriptor_count;
+        if (direct_resolved || direct_verify) {
+          ++descriptor_count;
+        }
+        if (command_processor_.RequestOneUseSingleViewDescriptors(descriptor_count, descriptors)) {
           if (bindless_resources_used_) {
             if (draw_resolution_scaled) {
               descriptor_dest = descriptors[0];
@@ -1510,26 +1937,109 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           } else {
             shared_memory.UseForWriting();
           }
-          TransitionEdramBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-
-          // Submit the resolve.
-          command_list.D3DSetComputeRootSignature(resolve_copy_root_signature_);
-          command_list.D3DSetComputeRootDescriptorTable(2, descriptor_source.second);
-          command_list.D3DSetComputeRootDescriptorTable(1, descriptor_dest.second);
-          if (draw_resolution_scaled) {
-            command_list.D3DSetComputeRoot32BitConstants(
-                0, sizeof(copy_shader_constants.dest_relative) / sizeof(uint32_t),
-                &copy_shader_constants.dest_relative, 0);
-          } else {
-            command_list.D3DSetComputeRoot32BitConstants(
-                0, sizeof(copy_shader_constants) / sizeof(uint32_t), &copy_shader_constants, 0);
+          // nb: the direct shader reads the render target the dump would have read, through its own SRV.
+          D3D12RenderTarget* direct_source = nullptr;
+          uint32_t direct_constants[2] = {};
+          if (direct_resolved || direct_verify) {
+            direct_source = static_cast<D3D12RenderTarget*>(nb_direct_resolve.source);
+            const ui::d3d12::util::DescriptorCpuGpuHandlePair& descriptor_direct_source =
+                descriptors[descriptor_index_direct_source];
+            command_processor_.GetD3D12Provider().GetDevice()->CopyDescriptorsSimple(
+                1, descriptor_direct_source.first, direct_source->descriptor_srv().GetHandle(),
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            command_processor_.PushTransitionBarrier(
+                direct_source->resource(),
+                direct_source->SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            RenderTargetKey direct_source_key = direct_source->key();
+            direct_constants[0] = direct_source_key.base_tiles | (direct_source_key.GetPitchTiles() << 11);
+            direct_constants[1] = direct_verify_slot;
           }
-          command_processor_.SetExternalPipeline(resolve_copy_pipelines_[size_t(copy_shader)]);
-          command_processor_.SubmitBarriers();
-          {
-            D3D12CommandProcessor::NativeGpuPassScope copy_scope(command_processor_,
-                "resolve_copy", uint64_t(copy_shader), copy_group_count_x, copy_group_count_y);
-            command_list.D3DDispatch(copy_group_count_x, copy_group_count_y, 1);
+          auto set_copy_constants = [&]() {
+            if (draw_resolution_scaled) {
+              command_list.D3DSetComputeRoot32BitConstants(
+                  0, sizeof(copy_shader_constants.dest_relative) / sizeof(uint32_t),
+                  &copy_shader_constants.dest_relative, 0);
+            } else {
+              command_list.D3DSetComputeRoot32BitConstants(
+                  0, sizeof(copy_shader_constants) / sizeof(uint32_t), &copy_shader_constants, 0);
+            }
+          };
+          auto set_direct_parameters = [&]() {
+            command_list.D3DSetComputeRootSignature(direct_resolve_root_signature_color_);
+            command_list.D3DSetComputeRootDescriptorTable(
+                2, descriptors[descriptor_index_direct_source].second);
+            command_list.D3DSetComputeRootDescriptorTable(1, descriptor_dest.second);
+            set_copy_constants();
+            command_list.D3DSetComputeRoot32BitConstants(3, 2, direct_constants, 0);
+          };
+
+          if (direct_resolved) {
+            // Submit the resolve, reading the render target instead of the EDRAM buffer.
+            set_direct_parameters();
+            command_processor_.SetExternalPipeline(nb_direct_resolve.pipeline);
+            command_processor_.SubmitBarriers();
+            {
+              // Timed as the copy it replaces (native_gpu_budget_probe's categories); no dump is timed.
+              D3D12CommandProcessor::NativeGpuPassScope copy_scope(command_processor_,
+                  "resolve_copy", uint64_t(copy_shader), copy_group_count_x, copy_group_count_y);
+              command_list.D3DDispatch(copy_group_count_x, copy_group_count_y, 1);
+            }
+          } else {
+            TransitionEdramBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+            // Submit the resolve.
+            command_list.D3DSetComputeRootSignature(resolve_copy_root_signature_);
+            command_list.D3DSetComputeRootDescriptorTable(2, descriptor_source.second);
+            command_list.D3DSetComputeRootDescriptorTable(1, descriptor_dest.second);
+            set_copy_constants();
+            command_processor_.SetExternalPipeline(resolve_copy_pipelines_[size_t(copy_shader)]);
+            command_processor_.SubmitBarriers();
+            {
+              D3D12CommandProcessor::NativeGpuPassScope copy_scope(command_processor_,
+                  "resolve_copy", uint64_t(copy_shader), copy_group_count_x, copy_group_count_y);
+              command_list.D3DDispatch(copy_group_count_x, copy_group_count_y, 1);
+            }
+          }
+
+          // nb: the check compares, store by store, what the direct shader would write with what the copy
+          // above just wrote. Never time inside it.
+          if (direct_verify) {
+            ID3D12PipelineState*& verify_pipeline =
+                nb_direct_resolve.verify_pipelines[nb_direct_resolve.pipeline_key];
+            if (!verify_pipeline) {
+              DirectResolvePipelineKey key;
+              key.dump_pipeline_key.msaa_samples = direct_source->key().msaa_samples;
+              key.dump_pipeline_key.resource_format = direct_source->key().resource_format;
+              NbDirectResolveShaderOptions options;
+              options.copy_shader_file = NbDirectResolveCopyShaderFile(copy_shader);
+              options.source_format = key.dump_pipeline_key.resource_format;
+              GetColorOwnershipTransferDXGIFormat(key.dump_pipeline_key.GetColorFormat(),
+                                                  &options.source_is_uint);
+              options.source_msaa_samples = uint32_t(key.dump_pipeline_key.msaa_samples);
+              options.resolution_scaled = draw_resolution_scaled;
+              options.scale_x = draw_resolution_scaled ? draw_resolution_scale_x() : 1;
+              options.scale_y = draw_resolution_scaled ? draw_resolution_scale_y() : 1;
+              options.host_sample_2x[0] = draw_util::GetD3D10SampleIndexForGuest2xMSAA(0, msaa_2x_supported_);
+              options.host_sample_2x[1] = draw_util::GetD3D10SampleIndexForGuest2xMSAA(1, msaa_2x_supported_);
+              options.verify = true;
+              verify_pipeline = NbCreateDirectResolvePipeline(command_processor_.GetD3D12Provider().GetDevice(),
+                                                              direct_resolve_root_signature_color_, options);
+            }
+            if (verify_pipeline) {
+              // The copy's stores must be visible to the check's loads.
+              command_processor_.PushUAVBarrier(nullptr);
+              set_direct_parameters();
+              command_list.D3DSetComputeRootUnorderedAccessView(
+                  4, nb_direct_resolve.verify_counters->GetGPUVirtualAddress());
+              command_processor_.SetExternalPipeline(verify_pipeline);
+              command_processor_.SubmitBarriers();
+              command_list.D3DDispatch(copy_group_count_x, copy_group_count_y, 1);
+            } else {
+              // The reserved slot stays at zero stores, which fails the check rather than passing it.
+              REXGPU_ERROR("nb direct resolve check: no check pipeline for {:011X}",
+                           nb_direct_resolve.pipeline_key);
+            }
           }
 
           // Order the resolve with other work using the destination as a UAV.
@@ -5985,63 +6495,101 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDirectResolvePipeline(
   if (pipeline_it != direct_resolve_pipelines_.end()) {
     return pipeline_it->second;
   }
+  // nb: the copy shader's own source with its EDRAM reads served from the render target
+  // (nb_direct_resolve.hlsl). TryResolveCopyDirectly has checked that the key is supported.
   ID3D12PipelineState* pipeline = nullptr;
-  // Until dedicated direct host RT -> shared memory shaders are added, reuse
-  // the resolve copy pipelines to keep all resolve shader modes wired for the
-  // direct preflight path.
-  size_t copy_shader_index = size_t(key.copy_shader);
-  if (copy_shader_index < size_t(draw_util::ResolveCopyShaderIndex::kCount)) {
-    pipeline = resolve_copy_pipelines_[copy_shader_index];
+  int copy_shader_file = NbDirectResolveCopyShaderFile(key.copy_shader);
+  if (direct_resolve_root_signature_color_ && copy_shader_file >= 0 && !key.dump_pipeline_key.is_depth) {
+    NbDirectResolveShaderOptions options;
+    options.copy_shader_file = copy_shader_file;
+    options.source_format = key.dump_pipeline_key.resource_format;
+    GetColorOwnershipTransferDXGIFormat(key.dump_pipeline_key.GetColorFormat(), &options.source_is_uint);
+    options.source_msaa_samples = uint32_t(key.dump_pipeline_key.msaa_samples);
+    options.resolution_scaled = key.draw_resolution_scaled;
+    options.scale_x = key.draw_resolution_scaled ? draw_resolution_scale_x() : 1;
+    options.scale_y = key.draw_resolution_scaled ? draw_resolution_scale_y() : 1;
+    options.host_sample_2x[0] = draw_util::GetD3D10SampleIndexForGuest2xMSAA(0, msaa_2x_supported_);
+    options.host_sample_2x[1] = draw_util::GetD3D10SampleIndexForGuest2xMSAA(1, msaa_2x_supported_);
+    options.verify = false;
+    pipeline = NbCreateDirectResolvePipeline(command_processor_.GetD3D12Provider().GetDevice(),
+                                             direct_resolve_root_signature_color_, options);
+    // The check variant is created on first use, from the same options.
   }
+  // Even if creation fails, still store the null pointer not to try to create again.
   direct_resolve_pipelines_.emplace(key, pipeline);
   return pipeline;
 }
 
+// nb: decides whether this resolve can read the render target directly and, if so, leaves the render target
+// and the pipeline in nb_direct_resolve for Resolve, which records the dispatch. Returns false, with nothing
+// recorded, when the resolve must keep the dump.
 bool D3D12RenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
                                                     draw_util::ResolveCopyShaderIndex copy_shader,
                                                     bool draw_resolution_scaled) {
   ++direct_resolve_attempt_count_;
-  (void)copy_shader;
-  (void)draw_resolution_scaled;
-  if (!direct_resolve_root_signature_color_ || !direct_resolve_root_signature_depth_) {
+  nb_direct_resolve.source = nullptr;
+  nb_direct_resolve.pipeline = nullptr;
+  if (resolve_info.IsCopyingDepth()) {
+    NbDirectResolveNoteFallback(kNbDirectResolveFallbackDepth);
+    return false;
+  }
+  if (resolve_info.color_edram_info.format_is_64bpp) {
+    NbDirectResolveNoteFallback(kNbDirectResolveFallback64bpp);
+    return false;
+  }
+  if (NbDirectResolveCopyShaderFile(copy_shader) < 0) {
+    NbDirectResolveNoteFallback(kNbDirectResolveFallbackCopyShader);
     return false;
   }
 
+  // The render target must own every tile the copy reads: the dump writes only owned ranges, and the copy
+  // reads whatever the EDRAM buffer holds elsewhere. So exactly one rectangle, covering the whole span.
   uint32_t dump_base;
   uint32_t dump_row_length_used;
   uint32_t dump_rows;
   uint32_t dump_pitch;
   resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
-  GetResolveCopyDispatchesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
-                                 dump_rectangles_, direct_resolve_dispatches_);
-  if (direct_resolve_dispatches_.empty()) {
+  GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
+                                 dump_rectangles_);
+  if (dump_rectangles_.size() != 1) {
+    NbDirectResolveNoteFallback(kNbDirectResolveFallbackOwnership);
+    return false;
+  }
+  const ResolveCopyDumpRectangle& rectangle = dump_rectangles_.front();
+  if (rectangle.row_first != 0 || rectangle.rows != dump_rows || rectangle.row_first_start != 0 ||
+      rectangle.row_last_end != std::min(dump_row_length_used, dump_pitch) || !rectangle.render_target) {
+    NbDirectResolveNoteFallback(kNbDirectResolveFallbackOwnership);
+    return false;
+  }
+  auto* render_target = static_cast<D3D12RenderTarget*>(rectangle.render_target);
+  RenderTargetKey rt_key = render_target->key();
+  if (rt_key.is_depth || rt_key.Is64bpp() ||
+      !NbDirectResolveSourceFormatSupported(rt_key.GetColorFormat())) {
+    NbDirectResolveNoteFallback(kNbDirectResolveFallbackSourceFormat);
     return false;
   }
 
-  for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
-    const auto* render_target = static_cast<const D3D12RenderTarget*>(rectangle.render_target);
-    if (render_target == nullptr) {
-      return false;
-    }
-    DumpPipelineKey dump_pipeline_key;
-    dump_pipeline_key.msaa_samples = render_target->key().msaa_samples;
-    dump_pipeline_key.resource_format = render_target->key().resource_format;
-    dump_pipeline_key.is_depth = render_target->key().is_depth;
-    if (!GetOrCreateDumpPipeline(dump_pipeline_key)) {
-      return false;
-    }
-    DirectResolvePipelineKey direct_pipeline_key;
-    direct_pipeline_key.dump_pipeline_key = dump_pipeline_key;
-    direct_pipeline_key.copy_shader = copy_shader;
-    direct_pipeline_key.draw_resolution_scaled = draw_resolution_scaled;
-    if (!GetOrCreateDirectResolvePipeline(direct_pipeline_key)) {
-      return false;
-    }
+  DirectResolvePipelineKey direct_pipeline_key;
+  direct_pipeline_key.dump_pipeline_key.msaa_samples = rt_key.msaa_samples;
+  direct_pipeline_key.dump_pipeline_key.resource_format = rt_key.resource_format;
+  direct_pipeline_key.dump_pipeline_key.is_depth = 0;
+  direct_pipeline_key.copy_shader = copy_shader;
+  direct_pipeline_key.draw_resolution_scaled = draw_resolution_scaled;
+  ID3D12PipelineState* pipeline = GetOrCreateDirectResolvePipeline(direct_pipeline_key);
+  if (!pipeline) {
+    NbDirectResolveNoteFallback(kNbDirectResolveFallbackPipeline);
+    return false;
   }
-
-  // Dedicated direct resolve dispatches are staged behind the same preflight;
-  // keep using the existing dump path until source-image direct shaders land.
-  return DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+  nb_direct_resolve.source = render_target;
+  nb_direct_resolve.pipeline = pipeline;
+  nb_direct_resolve.pipeline_key = direct_pipeline_key.packed();
+  if (std::find(nb_direct_resolve.logged_pipelines.begin(), nb_direct_resolve.logged_pipelines.end(),
+                nb_direct_resolve.pipeline_key) == nb_direct_resolve.logged_pipelines.end()) {
+    nb_direct_resolve.logged_pipelines.push_back(nb_direct_resolve.pipeline_key);
+    REXGPU_INFO("nb direct resolve: pipeline {:011X} serves copy shader {} from {} render targets",
+                nb_direct_resolve.pipeline_key, uint32_t(copy_shader), rt_key.GetDebugName());
+  }
+  return true;
 }
 
 bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,

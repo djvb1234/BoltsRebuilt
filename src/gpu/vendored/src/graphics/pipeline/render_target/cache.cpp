@@ -41,7 +41,9 @@ REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend, tru
 REXCVAR_DEFINE_BOOL(snorm16_render_target_full_range, true, "GPU",
                     "Use full range for SNORM16 render targets");
 
-REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
+// nb: upstream defaults this to true, but upstream's direct path was a stub that still dumped. The D3D12 cache
+// now implements it (d3d12/direct_resolve/nb_direct_resolve.hlsl), so it stays off until measured.
+REXCVAR_DEFINE_BOOL(direct_host_resolve, false, "GPU",
                     "Resolve from host render targets directly to shared memory when possible")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
