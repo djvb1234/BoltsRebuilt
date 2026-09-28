@@ -69,6 +69,11 @@ REXCVAR_DEFINE_INT32(d3d12_pipeline_creation_threads, -1, "GPU/D3D12",
     .range(-1, 32)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(nb_shader_storage_preload_threads, false, "nb",
+                    "While creating stored pipelines at launch, add the creation threads the upstream loop "
+                    "computes but never starts, and honour the blocking wait for pipelines still in flight")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
                     "Render tessellation as wireframe");
 
@@ -546,7 +551,15 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
     size_t creation_thread_needed_count =
         std::max(std::min(pipeline_stored_descriptions.size(), logical_processor_count) - size_t(1),
                  creation_thread_original_count);
-    while (creation_threads_.size() < creation_thread_original_count) {
+    // nb: upstream compares against creation_thread_original_count, so this
+    // loop never runs and needed_count goes unused, which also leaves the
+    // blocking wait below dead. nb_shader_storage_preload_threads tops the
+    // pool up to needed_count as the comment above intends; off keeps the
+    // original (no extra threads).
+    const size_t creation_thread_target_count = REXCVAR_GET(nb_shader_storage_preload_threads)
+                                                    ? creation_thread_needed_count
+                                                    : creation_thread_original_count;
+    while (creation_threads_.size() < creation_thread_target_count) {
       size_t creation_thread_index = creation_threads_.size();
       std::unique_ptr<rex::thread::Thread> creation_thread = rex::thread::Thread::Create(
           {}, [this, creation_thread_index]() { CreationThread(creation_thread_index); });
