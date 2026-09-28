@@ -62,7 +62,10 @@ class NativeAssetCache {
   const Stats& stats() const;
   // Caller must finish all GPU submissions first and destroy this cache before
   // SharedMemory. Unregisters the global watch before releasing its context.
-  void Shutdown();
+  // completion_proven=false means submitted draws may still read the arena: the
+  // default and staging resources are then retained (their references leak)
+  // instead of released, as NativeConstantUploadPool::Shutdown does.
+  void Shutdown(bool completion_proven = true);
 
  private:
   struct Impl;

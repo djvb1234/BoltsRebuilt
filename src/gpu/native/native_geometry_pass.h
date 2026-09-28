@@ -188,6 +188,10 @@ class NativeGeometryPass {
     uint64_t residency_resets = 0;  // cache drops caused by a shared-memory invalidation
   };
   static Timings& timings();
+  // Unregisters the shared-memory residency watch and drops the residency bitmap. The command
+  // processor calls it from ShutdownContext before the SharedMemory it was registered on is destroyed,
+  // so SharedMemory::ShutdownCommon finds no watch left and the next context registers afresh.
+  static void ReleaseResidencyWatch();
 
   // Lifetime totals on the command processor thread; independent of the
   // periodic timing reset so benchmark callers can take interval differences.
