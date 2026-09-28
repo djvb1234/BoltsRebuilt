@@ -46,6 +46,10 @@ REXCVAR_DEFINE_BOOL(nb_native_range_diagnostics, false, "nb",
 REXCVAR_DEFINE_BOOL(nb_native_shared_residency_mirror, false, "nb",
                     "Reuse completed shared-memory residency checks with an atomically invalidated page mirror")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(nb_native_shared_residency_promote_uploads, false, "nb",
+                    "With nb_native_shared_residency_mirror, also mirror pages this request just uploaded and "
+                    "that are still valid afterwards, so the first repeat request in a frame hits")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace nb::gpu {
 namespace {
@@ -572,6 +576,7 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
       residency_owner ? &native_residency_request_depth_ : nullptr);
   nb::gpu::NativeSharedResidencyMirror* residency_mirror = PrepareNativeResidencyRequest(
       REXCVAR_GET(nb_native_shared_residency_mirror), residency_owner, residency_scope.outer());
+  const bool promote_uploads = REXCVAR_GET(nb_native_shared_residency_promote_uploads);
 
   const bool optimize = REXCVAR_GET(nb_range_batch_optimize);
   nb::gpu::NativeRangeBatchStats* diagnostics = REXCVAR_GET(nb_range_batch_diagnostics)
@@ -728,6 +733,15 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     }
     const bool uploaded = UploadRanges(upload_ranges_);
     if (range_profile && !uploaded) ++range_profile->upload_failures;
+    // Without this, a range uploaded here misses the mirror on its next request
+    // too, because only pages already valid at scan time are promoted. After a
+    // successful upload, the pages still valid under the lock are exactly what
+    // that next request's scan would find, so it can skip the scan.
+    if (uploaded && residency_mirror && promote_uploads) {
+      auto global_lock = global_critical_region_.Acquire();
+      nb::gpu::shared_residency_stats.upload_promoted_pages += residency_mirror->PromoteLiveRanges(
+          merged_ranges, system_page_flags_valid_.data(), system_page_flags_valid_.size());
+    }
     range_observation.Outcome(nb::gpu::NativeRangeOutcome::kUpload);
     return uploaded;
   };

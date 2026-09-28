@@ -76,6 +76,7 @@ REXCVAR_DECLARE(bool, nb_native_stage_vertex_constants);
 REXCVAR_DECLARE(bool, nb_native_vertex_constant_reuse);
 REXCVAR_DECLARE(bool, nb_native_pipeline_key_normalize);
 REXCVAR_DECLARE(bool, nb_native_shared_residency_mirror);
+REXCVAR_DECLARE(bool, nb_native_shared_residency_promote_uploads);
 REXCVAR_DECLARE(bool, nb_native_empty_constant_layout);
 REXCVAR_DECLARE(bool, nb_native_constant_binding_packet);
 REXCVAR_DECLARE(bool, nb_native_constant_upload_diagnostics);
@@ -338,6 +339,7 @@ AssetBenchmarkPhase AssetPhaseForFrame(uint64_t frame) {
   // 17592186044416 re-reads blocked WAIT_REG_MEM predicates at yield cadence for up to 5 ms.
   // 35184372088832 draws alpha-test-free native pixel shaders when the alpha test cannot discard.
   // 70368744177664 skips render-target claims that the ownership map already satisfies.
+  // 140737488355328 also mirrors pages just uploaded (needs 4294967296 to have any effect).
   if (offset / length >= (perf_start > 0 ? PerfBenchmarkOptions().size() : std::size(modes))) return phase;
   phase.window = int(offset / length);
   if (perf_start > 0) phase.options = PerfBenchmarkOptions()[phase.window];
@@ -392,6 +394,7 @@ int64_t CurrentPerfOptions() {
          (REXCVAR_GET(nb_native_wait_spin_us) > 0 ? 17592186044416LL : 0) |
          (REXCVAR_GET(nb_native_alpha_test_variant) ? 35184372088832LL : 0) |
          (REXCVAR_GET(nb_rt_ownership_fastpath) ? 70368744177664LL : 0) |
+         (REXCVAR_GET(nb_native_shared_residency_promote_uploads) ? 140737488355328LL : 0) |
          (REXCVAR_GET(nb_native_replay_chunk_draws) >= 2048 ? 2199023255552LL :
           REXCVAR_GET(nb_native_replay_chunk_draws) > 0 ? 1099511627776LL : 0)
 #if NB_HAS_RUNTIME_WATCH_CONTROL
@@ -442,6 +445,7 @@ void ApplyPerfOptions(int64_t options) {
   REXCVAR_SET(nb_native_wait_spin_us, (options & 17592186044416LL) ? 5000 : 0);
   REXCVAR_SET(nb_native_alpha_test_variant, (options & 35184372088832LL) != 0);
   REXCVAR_SET(nb_rt_ownership_fastpath, (options & 70368744177664LL) != 0);
+  REXCVAR_SET(nb_native_shared_residency_promote_uploads, (options & 140737488355328LL) != 0);
   REXCVAR_SET(nb_native_replay_chunk_draws, (options & 2199023255552LL) ? 2048 :
                                         (options & 1099511627776LL) ? 1024 : 0);
 #if NB_HAS_RUNTIME_WATCH_CONTROL
@@ -1090,9 +1094,9 @@ void NbCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
       }
     }
     const auto& mirror = GetNativeSharedResidencyStats();
-    REXLOG_INFO("rexgpu-nb:   shared residency mirror cumulative: {} requests / {} hits / {} misses, {} hit ranges / {} bytes / {} pages, {} promoted pages, {} recursive / {} page-size / {} caller bypasses, {} initialization failures / {} mode resets",
+    REXLOG_INFO("rexgpu-nb:   shared residency mirror cumulative: {} requests / {} hits / {} misses, {} hit ranges / {} bytes / {} pages, {} promoted pages / {} after upload, {} recursive / {} page-size / {} caller bypasses, {} initialization failures / {} mode resets",
                 mirror.requests, mirror.hits, mirror.misses, mirror.hit_ranges, mirror.hit_bytes,
-                mirror.hit_pages, mirror.promoted_pages, mirror.recursive_bypasses,
+                mirror.hit_pages, mirror.promoted_pages, mirror.upload_promoted_pages, mirror.recursive_bypasses,
                 mirror.unsupported_page_bypasses, mirror.unsupported_caller_bypasses,
                 mirror.initialization_failures, mirror.mode_resets);
     REXLOG_INFO("rexgpu-nb:   command CPU per frame: shader loads {:.3f} ms, copies {:.3f} ms, swaps {:.3f} ms (nested draw/copy costs overlap)",
