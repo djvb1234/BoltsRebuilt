@@ -131,13 +131,13 @@ REXCVAR_DEFINE_BOOL(nb_native_immutable_watch_fastpath, false, "nb",
 REXCVAR_DEFINE_INT64(nb_native_perf_benchmark_start, 0, "nb",
                      "First frame of the native performance comparison; prewarms both shader forms from frame 3600, 0 disables");
 // Every default window holds the shipped defaults other than 16384 (bits 1 to 64, 256, 1024,
-// 65536, 1048576, 8589934592, 35184372088832 and 70368744177664) plus 128; the windows differ
+// 65536, 1048576, 8589934592, 35184372088832, 70368744177664 and 549755813888) plus 128; the windows differ
 // only in 2048 and 4096. 16384 stays clear so the perf: lines keep IssueDraw_ms/generic_ms,
 // which means these windows run the per-command clocks that normal play omits.
 // ApplyPerfOptions sets every bit, so a custom list must carry the defaults it means to keep.
 REXCVAR_DEFINE_STRING(nb_native_perf_benchmark_options,
-                      "105561707316735,105561707318783,105561707320831,105561707322879,"
-                      "105561707322879,105561707320831,105561707318783,105561707316735", "nb",
+                      "106111463130623,106111463132671,106111463134719,106111463136767,"
+                      "106111463136767,106111463134719,106111463132671,106111463130623", "nb",
                       "Comma-separated performance bitmasks (2 to 32 windows); fixed at benchmark startup");
 
 REXCVAR_DEFINE_BOOL(nb_native_demo, false, "nb",
