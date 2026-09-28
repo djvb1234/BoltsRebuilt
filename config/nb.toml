@@ -58,6 +58,11 @@ nb_native_stencil = true
 # can reuse shaded vertices; other native indexed draws keep the vertex-shader
 # index gather, and false restores the gather for every eligible draw.
 nb_native_hardware_indices = true
+# Replay each mid-frame submission's recorded commands into the D3D12 list on a
+# worker thread while the command thread moves on. Queue order, fence values and
+# the recorded commands are unchanged; the frame-closing submission still replays
+# on the command thread. false restores synchronous replay everywhere.
+nb_native_async_replay = true
 
 # The guest normally presents every second vblank: 480 Hz permits up to 240 FPS.
 # Some frame-counted behavior can run faster; use 60 for the original 30 FPS cap.
