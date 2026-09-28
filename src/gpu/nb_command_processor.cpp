@@ -636,6 +636,7 @@ void NbCommandProcessor::ShutdownContext() {
   // Queued draws must finish before the arena and its SharedMemory watch leave.
   const bool native_resources_idle = AwaitNativeResourcesIdle();
   native_asset_cache_.Shutdown();
+  NativeGeometryPass::ReleaseResidencyWatch();
   // A failed drain is not permission to release buffers still referenced by the
   // GPU. Shutdown(false) retains their resource references even through pool
   // destruction; a healthy device and completed drain permit normal release.

@@ -307,6 +307,9 @@ struct ResidencyCache {
 ResidencyCache g_residency;
 uint64_t g_residency_frame = UINT64_MAX;
 rex::graphics::SharedMemory::GlobalWatchHandle g_residency_watch = nullptr;
+// The SharedMemory the watch belongs to. ShutdownContext destroys it and SetupContext makes a new one, so
+// the handle is released against this owner and a new owner gets its own registration.
+rex::graphics::SharedMemory* g_residency_watch_owner = nullptr;
 
 struct PendingInvalidation {
   uint32_t address_first;
@@ -358,6 +361,18 @@ size_t DrainResidencyInvalidations() {
   return count;
 }
 
+// Drops the bitmap and anything queued for it. Command processor thread only.
+void DiscardResidencyState() {
+  {
+    std::lock_guard<std::mutex> lock(g_residency_pending_mutex);
+    g_residency_pending_count = 0;
+    g_residency_pending_overflow = false;
+    g_residency_pending_signal.store(0, std::memory_order_release);
+  }
+  g_residency.Reset();
+  g_residency_frame = UINT64_MAX;
+}
+
 // The command processor thread is the only writer, so a plain static is enough.
 NativeGeometryPass::Timings g_timings;
 NativeGeometryPass::ConstantReuseStats g_constant_reuse_stats;
@@ -371,6 +386,16 @@ std::atomic<uint32_t> g_no_alpha_test_pipelines_in_flight{0};
 }  // namespace
 
 NativeGeometryPass::Timings& NativeGeometryPass::timings() { return g_timings; }
+
+void NativeGeometryPass::ReleaseResidencyWatch() {
+  if (g_residency_watch != nullptr && g_residency_watch_owner != nullptr) {
+    g_residency_watch_owner->UnregisterGlobalWatch(g_residency_watch);
+  }
+  g_residency_watch = nullptr;
+  g_residency_watch_owner = nullptr;
+  DiscardResidencyState();
+}
+
 const NativeGeometryPass::ConstantReuseStats& NativeGeometryPass::constant_reuse_stats() {
   return g_constant_reuse_stats;
 }
@@ -1288,8 +1313,14 @@ bool NativeGeometryPass::Record(D3D12CommandProcessor& cp, const D3D12CommandPro
   // frame's 3.76 ms, with everything else at 0.01 ms - and three separate calls walk the page bitmap
   // three times over.
   auto& shared_memory = cp.shared_memory();
-  if (g_residency_watch == nullptr) {
+  if (g_residency_watch_owner != &shared_memory) {
+    // First native draw on this SharedMemory. ShutdownContext has already released the watch held on
+    // the previous one (ReleaseResidencyWatch), so this registers afresh instead of keeping a handle into
+    // a destroyed object.
     g_residency_watch = shared_memory.RegisterGlobalWatch(ResidencyInvalidated, nullptr);
+    g_residency_watch_owner = &shared_memory;
+    // Nothing the bitmap says about the previous SharedMemory holds for this one.
+    DiscardResidencyState();
   }
   // Shared memory drops the valid bit on every page that was valid only because the CPU uploaded it
   // when a frame closes (clear_memory_page_state, on by default) and that sweep fires no watch, so the
