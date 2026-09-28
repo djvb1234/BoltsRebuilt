@@ -278,6 +278,9 @@ void CommandProcessor::WorkerThreadMain() {
       idle_timer.Start();
       uint32_t loop_count = 0;
       do {
+        // nb: a subclass with work owed to the guest (the D3D12 deferred
+        // occlusion results) gets a chance at it on every idle iteration.
+        if (loop_count) PrepareForWait();
         // If we spin around too much, revert to a "low-power" state.
         if (loop_count > 500) {
           const int wait_time_ms = 5;

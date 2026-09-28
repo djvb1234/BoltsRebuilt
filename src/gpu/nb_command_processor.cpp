@@ -22,6 +22,7 @@
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/native_command_wait_stats.h>
+#include <rex/graphics/d3d12/native_gpu_wait_stats.h>
 #include <rex/graphics/d3d12/native_submission_stats.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/logging.h>
@@ -91,6 +92,7 @@ REXCVAR_DECLARE(bool, nb_native_narrow_invalidation);
 REXCVAR_DECLARE(bool, nb_native_invalidation_diagnostics);
 REXCVAR_DECLARE(int32_t, anisotropic_override);
 REXCVAR_DECLARE(bool, nb_rt_ownership_fastpath);
+REXCVAR_DECLARE(bool, nb_occlusion_query_deferred);
 REXCVAR_DEFINE_BOOL(nb_native_minimal_command_diagnostics, true, "nb",
                     "Omit per-command shader/draw/copy and generic CPU clocks, so IssueDraw/generic and shader-load/copy "
                     "figures read 0; false restores them. Wall-frame and swap timing remain")
@@ -271,7 +273,7 @@ const std::vector<int64_t>& PerfBenchmarkOptions() {
       int64_t value = 0;
       const auto parsed = std::from_chars(text.data() + start, text.data() + end, value);
       if (parsed.ec != std::errc{} || parsed.ptr != text.data() + end || value < 0 ||
-          value > 281474976710655LL || result.size() == 32 || end + 1 == text.size()) {
+          value > 144115188075855871LL || result.size() == 32 || end + 1 == text.size()) {
         REXLOG_ERROR("rexgpu-nb: invalid performance benchmark option list");
         return std::vector<int64_t>{};
       }
@@ -392,6 +394,7 @@ int64_t CurrentPerfOptions() {
          (REXCVAR_GET(nb_native_wait_spin_us) > 0 ? 17592186044416LL : 0) |
          (REXCVAR_GET(nb_native_alpha_test_variant) ? 35184372088832LL : 0) |
          (REXCVAR_GET(nb_rt_ownership_fastpath) ? 70368744177664LL : 0) |
+         (REXCVAR_GET(nb_occlusion_query_deferred) ? 2251799813685248LL : 0) |
          (REXCVAR_GET(nb_native_replay_chunk_draws) >= 2048 ? 2199023255552LL :
           REXCVAR_GET(nb_native_replay_chunk_draws) > 0 ? 1099511627776LL : 0)
 #if NB_HAS_RUNTIME_WATCH_CONTROL
@@ -442,6 +445,7 @@ void ApplyPerfOptions(int64_t options) {
   REXCVAR_SET(nb_native_wait_spin_us, (options & 17592186044416LL) ? 5000 : 0);
   REXCVAR_SET(nb_native_alpha_test_variant, (options & 35184372088832LL) != 0);
   REXCVAR_SET(nb_rt_ownership_fastpath, (options & 70368744177664LL) != 0);
+  REXCVAR_SET(nb_occlusion_query_deferred, (options & 2251799813685248LL) != 0);
   REXCVAR_SET(nb_native_replay_chunk_draws, (options & 2199023255552LL) ? 2048 :
                                         (options & 1099511627776LL) ? 1024 : 0);
 #if NB_HAS_RUNTIME_WATCH_CONTROL
@@ -1106,6 +1110,43 @@ void NbCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
                 double(interval_draws_) / frames, issue_draw_ns_ / 1.0e6 / frames, generic_pass_ns_ / 1.0e6 / frames,
                 timings.residency_ns / 1.0e6 / frames, timings.asset_match_ns / 1.0e6 / frames,
                 double(snapshot_bytes - interval_snapshot_bytes_) / frames);
+    {
+      // Count-only; the clocks run only inside waits that already block.
+      using rex::graphics::d3d12::NativeGpuWaitStats;
+      static NativeGpuWaitStats last_waits;
+      const NativeGpuWaitStats& now = rex::graphics::d3d12::GetNativeGpuWaitStats();
+      const auto per_frame = [frames](uint64_t now_value, uint64_t last_value) {
+        return double(now_value - last_value) / frames;
+      };
+      const auto ms_per_frame = [frames](uint64_t now_ns, uint64_t last_ns) {
+        return double(now_ns - last_ns) / 1.0e6 / frames;
+      };
+      REXLOG_INFO("rexgpu-nb: gpu waits per frame: submissions {:.2f} (swap {:.2f} / primary buffer end {:.2f} / "
+                  "occlusion query {:.2f} / other {:.2f}), frame latency {:.2f} waits {:.3f} ms, drains {:.2f} waits {:.3f} ms, "
+                  "pipeline creation {:.2f} waits {:.3f} ms, occlusion queries {:.2f} begun / {:.2f} sync ends {:.3f} ms / "
+                  "{:.2f} deferred ends / {:.2f} deferred results / {:.2f} forced",
+                  per_frame(now.submissions_swap + now.submissions_primary_buffer_end +
+                                now.submissions_occlusion_query + now.submissions_other,
+                            last_waits.submissions_swap + last_waits.submissions_primary_buffer_end +
+                                last_waits.submissions_occlusion_query + last_waits.submissions_other),
+                  per_frame(now.submissions_swap, last_waits.submissions_swap),
+                  per_frame(now.submissions_primary_buffer_end, last_waits.submissions_primary_buffer_end),
+                  per_frame(now.submissions_occlusion_query, last_waits.submissions_occlusion_query),
+                  per_frame(now.submissions_other, last_waits.submissions_other),
+                  per_frame(now.frame_latency_waits, last_waits.frame_latency_waits),
+                  ms_per_frame(now.frame_latency_wait_ns, last_waits.frame_latency_wait_ns),
+                  per_frame(now.drain_waits, last_waits.drain_waits),
+                  ms_per_frame(now.drain_wait_ns, last_waits.drain_wait_ns),
+                  per_frame(now.pipeline_waits, last_waits.pipeline_waits),
+                  ms_per_frame(now.pipeline_wait_ns, last_waits.pipeline_wait_ns),
+                  per_frame(now.occlusion_begins, last_waits.occlusion_begins),
+                  per_frame(now.occlusion_sync_ends, last_waits.occlusion_sync_ends),
+                  ms_per_frame(now.occlusion_sync_ns, last_waits.occlusion_sync_ns),
+                  per_frame(now.occlusion_deferred_ends, last_waits.occlusion_deferred_ends),
+                  per_frame(now.occlusion_deferred_results, last_waits.occlusion_deferred_results),
+                  per_frame(now.occlusion_deferred_forced, last_waits.occlusion_deferred_forced));
+      last_waits = now;
+    }
     REXLOG_INFO("rexgpu-nb:   native draw CPU per frame: pipeline {:.2f} ms, constants {:.2f} ms, "
                 "RequestRange {:.2f} ms, assets {:.2f} ms, UseForReading {:.2f} ms, record {:.2f} ms, texture request {:.2f} ms, texture bindings {:.2f} ms; residency {} hit / {} miss, {} invalidations folded",
                 timings.pipeline_ns / 1.0e6 / frames,

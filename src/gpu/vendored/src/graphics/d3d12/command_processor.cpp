@@ -27,6 +27,7 @@
 #include <rex/perf/counter.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/graphics_system.h>
+#include <rex/graphics/d3d12/native_gpu_wait_stats.h>
 #include <rex/graphics/d3d12/native_submission_stats.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
@@ -58,6 +59,16 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
 
 REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Off keeps the original synchronous answer: every guest occlusion query end
+// submits, awaits the whole GPU queue and writes the result before the packet
+// returns. On, the end packet only records the query; the result is written
+// when its submission's fence completes, as the Xenos writes it when the GPU
+// gets there. The guest sees its own "not finished" marker meanwhile, so this
+// changes when results become visible and is not output-identical.
+REXCVAR_DEFINE_BOOL(nb_occlusion_query_deferred, false, "nb",
+                    "Answer guest occlusion queries when their submission completes instead of "
+                    "awaiting the GPU at every query end")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(nb_native_pipeline_binding_diagnostics, false, "nb",
                     "Count external pipeline pointer changes without submission clocks");
@@ -366,6 +377,12 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
   if (!sample_counts) {
     DisableHostOcclusionQueries();
     return true;
+  }
+  // A deferred result still owed to this address is written first, so the
+  // begin/end marker below reads exactly as it would have without deferral.
+  if (!deferred_occlusion_results_.empty()) {
+    DeliverDeferredOcclusionResults();
+    AwaitDeferredOcclusionResults(DeferredOcclusionResultsThrough(sample_count_addr, UINT32_MAX));
   }
 
   auto write_fallback_result = [sample_counts, kQueryFinished]() -> bool {
@@ -2725,8 +2742,42 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
   if (REXCVAR_GET(d3d12_submit_on_primary_buffer_end) && submission_open_ &&
       CanEndSubmissionImmediately()) {
+    native_submission_cause_ = NativeSubmissionCause::kPrimaryBufferEnd;
     EndSubmission(false);
   }
+}
+
+void D3D12CommandProcessor::PrepareForWait() {
+  CommandProcessor::PrepareForWait();
+  if (deferred_occlusion_results_.empty()) return;
+  // The command processor is about to idle or sleep on a guest wait, which the
+  // guest may be making for one of these results. Submit what is recorded,
+  // write what has completed, and give the oldest pending result a short wait;
+  // the idle loop and guest waits call this again, so a result is written
+  // within about a millisecond of its fence without blocking new commands.
+  if (submission_open_) {
+    native_submission_cause_ = NativeSubmissionCause::kOcclusionQuery;
+    if (!EndSubmission(false)) return;
+  }
+  CheckSubmissionFence(0);
+  DeliverDeferredOcclusionResults();
+  if (deferred_occlusion_results_.empty() || device_removed_) return;
+  // A separate event: a timed-out wait leaves it armed, and a late signal must
+  // never wake CheckSubmissionFence's infinite waits early.
+  if (!deferred_occlusion_event_) {
+    deferred_occlusion_event_ = CreateEvent(nullptr, false, false, nullptr);
+    if (!deferred_occlusion_event_) return;
+  }
+  const uint64_t oldest = deferred_occlusion_results_.front().submission;
+  if (SUCCEEDED(submission_fence_->SetEventOnCompletion(oldest, deferred_occlusion_event_))) {
+    auto& waits = GetNativeGpuWaitStats();
+    const uint64_t start = NativeGpuWaitNowNs();
+    WaitForSingleObject(deferred_occlusion_event_, 1);
+    ++waits.drain_waits;
+    waits.drain_wait_ns += NativeGpuWaitNowNs() - start;
+  }
+  CheckSubmissionFence(0);
+  DeliverDeferredOcclusionResults();
 }
 
 Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
@@ -3854,7 +3905,11 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
         {
           NativeSubmissionTimer wait_timer(REXCVAR_GET(nb_native_submission_diagnostics)
               ? &GetNativeSubmissionStats().queue_operation_wait : nullptr);
+          const uint64_t wait_start = NativeGpuWaitNowNs();
           wait_result = WaitForSingleObject(fence_completion_event_, INFINITE);
+          auto& waits = GetNativeGpuWaitStats();
+          ++waits.drain_waits;
+          waits.drain_wait_ns += NativeGpuWaitNowNs() - wait_start;
           wait_timer.RecordFailure(wait_result != WAIT_OBJECT_0);
         }
         const uint64_t completed = queue_operations_since_submission_fence_->GetCompletedValue();
@@ -3891,7 +3946,17 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
       {
         NativeSubmissionTimer wait_timer(REXCVAR_GET(nb_native_submission_diagnostics)
             ? &GetNativeSubmissionStats().fence_wait : nullptr);
+        const uint64_t wait_start = NativeGpuWaitNowNs();
         const DWORD wait_result = WaitForSingleObject(fence_completion_event_, INFINITE);
+        const uint64_t wait_ns = NativeGpuWaitNowNs() - wait_start;
+        auto& waits = GetNativeGpuWaitStats();
+        if (native_frame_latency_await_) {
+          ++waits.frame_latency_waits;
+          waits.frame_latency_wait_ns += wait_ns;
+        } else {
+          ++waits.drain_waits;
+          waits.drain_wait_ns += wait_ns;
+        }
         wait_timer.RecordFailure(wait_result != WAIT_OBJECT_0);
       }
       const uint64_t completed_after_wait = submission_fence_->GetCompletedValue();
@@ -3909,6 +3974,8 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
     // Not updated - no need to reclaim or download things.
     return;
   }
+
+  if (!deferred_occlusion_results_.empty()) DeliverDeferredOcclusionResults();
 
   // Reclaim command allocators.
   while (command_allocator_submitted_first_) {
@@ -4042,8 +4109,10 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   // Check the fence - needed for all kinds of submissions (to reclaim transient
   // resources early) and specifically for frames (not to queue too many), and
   // await the availability of the current frame.
+  native_frame_latency_await_ = is_opening_frame;
   CheckSubmissionFence(is_opening_frame ? closed_frame_submissions_[frame_current_ % kQueueFrames]
                                         : 0);
+  native_frame_latency_await_ = false;
   if (device_removed_) return false;
   // TODO(Triang3l): If failed to await (completed submission < awaited frame
   // submission), do something like dropping the draw command that wanted to
@@ -4175,6 +4244,11 @@ static void NbDumpPhase3Counters(uint32_t frame) {
 }
 
 bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+  // The cause is counted once, for this call only.
+  struct NativeSubmissionCauseReset {
+    NativeSubmissionCause& cause;
+    ~NativeSubmissionCauseReset() { cause = NativeSubmissionCause::kOther; }
+  } native_submission_cause_reset{native_submission_cause_};
   // Drain CPU recording, then finalize any open chunk session below. A swap
   // still waits for the real queue submission before its presenter handoff.
   if (!FlushNativeReplay() || device_removed_) return false;
@@ -4205,11 +4279,27 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // stall: the submission cannot close until every queued async pipeline
     // creation has finished.
     const auto nb_pipeline_wait_start = std::chrono::steady_clock::now();
+    const bool nb_pipelines_pending = pipeline_cache_->IsCreatingPipelines();
     pipeline_cache_->EndSubmission();
-    GetPhase3Counters().swap_wait_time_us += static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
-                                                              nb_pipeline_wait_start)
-            .count());
+    const auto nb_pipeline_wait_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - nb_pipeline_wait_start).count();
+    GetPhase3Counters().swap_wait_time_us += static_cast<uint64_t>(nb_pipeline_wait_ns / 1000);
+    {
+      auto& waits = GetNativeGpuWaitStats();
+      if (nb_pipelines_pending) {
+        ++waits.pipeline_waits;
+        waits.pipeline_wait_ns += static_cast<uint64_t>(nb_pipeline_wait_ns);
+      }
+      if (is_swap) {
+        ++waits.submissions_swap;
+      } else if (native_submission_cause_ == NativeSubmissionCause::kPrimaryBufferEnd) {
+        ++waits.submissions_primary_buffer_end;
+      } else if (native_submission_cause_ == NativeSubmissionCause::kOcclusionQuery) {
+        ++waits.submissions_occlusion_query;
+      } else {
+        ++waits.submissions_other;
+      }
+    }
 
     // Submit barriers now because resources with the queued barriers may be
     // destroyed between frames.
@@ -5679,6 +5769,7 @@ ID3D12Resource* D3D12CommandProcessor::RequestReadbackBuffer(uint32_t size) {
 
 bool D3D12CommandProcessor::InitializeOcclusionQueryResources() {
   active_occlusion_query_ = {};
+  deferred_occlusion_results_.clear();
   occlusion_query_cursor_ = 0;
   occlusion_query_resources_available_ = false;
   occlusion_query_heap_.Reset();
@@ -5732,6 +5823,12 @@ bool D3D12CommandProcessor::InitializeOcclusionQueryResources() {
 
 void D3D12CommandProcessor::ShutdownOcclusionQueryResources() {
   DisableHostOcclusionQueries();
+  // Only a lost device leaves results here; the guest gets nothing for them.
+  deferred_occlusion_results_.clear();
+  if (deferred_occlusion_event_) {
+    CloseHandle(deferred_occlusion_event_);
+    deferred_occlusion_event_ = nullptr;
+  }
 
   if (occlusion_query_readback_ && occlusion_query_readback_mapping_) {
     occlusion_query_readback_->Unmap(0, nullptr);
@@ -5745,11 +5842,72 @@ bool D3D12CommandProcessor::AcquireOcclusionQueryIndex(uint32_t& host_index_out)
   if (occlusion_query_cursor_ >= kMaxOcclusionQueries) {
     occlusion_query_cursor_ = 0;
   }
+  // A deferred result still to be read from this readback slot comes first.
+  if (!deferred_occlusion_results_.empty()) {
+    AwaitDeferredOcclusionResults(
+        DeferredOcclusionResultsThrough(UINT32_MAX, occlusion_query_cursor_));
+    if (DeferredOcclusionResultsThrough(UINT32_MAX, occlusion_query_cursor_)) return false;
+  }
   host_index_out = occlusion_query_cursor_++;
   return true;
 }
 
+size_t D3D12CommandProcessor::DeferredOcclusionResultsThrough(uint32_t sample_count_address,
+                                                              uint32_t host_index) const {
+  for (size_t i = deferred_occlusion_results_.size(); i != 0; --i) {
+    const DeferredOcclusionResult& result = deferred_occlusion_results_[i - 1];
+    if (result.sample_count_address == sample_count_address || result.host_index == host_index) {
+      return i;
+    }
+  }
+  return 0;
+}
+
+void D3D12CommandProcessor::DeliverDeferredOcclusionResults() {
+  auto& waits = GetNativeGpuWaitStats();
+  while (!deferred_occlusion_results_.empty()) {
+    const DeferredOcclusionResult result = deferred_occlusion_results_.front();
+    if (result.submission > submission_completed_ || !occlusion_query_readback_mapping_) {
+      return;
+    }
+    deferred_occlusion_results_.pop_front();
+    auto* sample_counts =
+        memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(result.sample_count_address);
+    WriteGuestOcclusionResult(
+        sample_counts, NormalizeOcclusionSamples(occlusion_query_readback_mapping_[result.host_index]));
+    ++waits.occlusion_deferred_results;
+  }
+}
+
+void D3D12CommandProcessor::AwaitDeferredOcclusionResults(size_t count) {
+  count = std::min(count, deferred_occlusion_results_.size());
+  if (!count) return;
+  ++GetNativeGpuWaitStats().occlusion_deferred_forced;
+  const uint64_t await_submission = deferred_occlusion_results_[count - 1].submission;
+  if (await_submission >= submission_current_ && submission_open_) {
+    native_submission_cause_ = NativeSubmissionCause::kOcclusionQuery;
+  }
+  CheckSubmissionFence(await_submission);
+  DeliverDeferredOcclusionResults();
+  if (submission_completed_ >= await_submission && !device_removed_) return;
+  // The GPU could not prove completion (device loss or a failed submission).
+  // Answer these the way a failed synchronous end is answered.
+  const int32_t fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
+  while (!deferred_occlusion_results_.empty() &&
+         deferred_occlusion_results_.front().submission <= await_submission) {
+    auto* sample_counts = memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(
+        deferred_occlusion_results_.front().sample_count_address);
+    deferred_occlusion_results_.pop_front();
+    if (!sample_counts || fake_sample_count < 0) continue;
+    std::memset(sample_counts, 0, sizeof(xenos::xe_gpu_depth_sample_counts));
+    sample_counts->ZPass_A = fake_sample_count;
+    sample_counts->Total_A = fake_sample_count;
+  }
+}
+
 void D3D12CommandProcessor::DisableHostOcclusionQueries() {
+  // Resetting the cursor below is only safe with no slot still owed a result.
+  AwaitDeferredOcclusionResults(SIZE_MAX);
   if (active_occlusion_query_.valid && occlusion_query_heap_) {
     uint32_t host_index = active_occlusion_query_.host_index;
     // Clear before EndSubmission to prevent the EndSubmission safety net from issuing a second
@@ -5788,6 +5946,7 @@ bool D3D12CommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_addre
 
   deferred_command_list_.D3DBeginQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
                                        host_index);
+  ++GetNativeGpuWaitStats().occlusion_begins;
   active_occlusion_query_.sample_count_address = sample_count_address;
   active_occlusion_query_.host_index = host_index;
   active_occlusion_query_.valid = true;
@@ -5814,12 +5973,27 @@ bool D3D12CommandProcessor::EndGuestOcclusionQuery(
       occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, host_index, 1,
       occlusion_query_readback_.Get(), sizeof(uint64_t) * host_index);
 
+  auto& waits = GetNativeGpuWaitStats();
+  if (REXCVAR_GET(nb_occlusion_query_deferred)) {
+    // Leave the guest's "not finished" marker in place; the result is written
+    // once this submission's fence completes (CheckSubmissionFence,
+    // PrepareForWait, or an await when the address or slot is reused).
+    deferred_occlusion_results_.push_back({sample_count_address, host_index, submission_current_});
+    ++waits.occlusion_deferred_ends;
+    return true;
+  }
+
+  const uint64_t sync_start = NativeGpuWaitNowNs();
+  ++waits.occlusion_sync_ends;
+  native_submission_cause_ = NativeSubmissionCause::kOcclusionQuery;
   if (!EndSubmission(false)) {
+    waits.occlusion_sync_ns += NativeGpuWaitNowNs() - sync_start;
     return false;
   }
 
   uint64_t query_submission = submission_current_ ? submission_current_ - 1 : 0;
   CheckSubmissionFence(query_submission);
+  waits.occlusion_sync_ns += NativeGpuWaitNowNs() - sync_start;
   if (submission_completed_ < query_submission) {
     return false;
   }

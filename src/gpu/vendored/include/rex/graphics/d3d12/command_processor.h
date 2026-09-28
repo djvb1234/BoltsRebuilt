@@ -364,6 +364,10 @@ class D3D12CommandProcessor : public CommandProcessor {
                  uint32_t frontbuffer_height) override;
 
   void OnPrimaryBufferEnd() override;
+  // Delivers deferred occlusion query results before the command processor
+  // idles or sleeps on a guest wait, so a guest waiting for one never waits on
+  // a submission that cannot complete.
+  void PrepareForWait() override;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -572,6 +576,15 @@ class D3D12CommandProcessor : public CommandProcessor {
                               xenos::xe_gpu_depth_sample_counts* sample_counts);
   bool AcquireOcclusionQueryIndex(uint32_t& host_index_out);
   void DisableHostOcclusionQueries();
+  // nb_occlusion_query_deferred. Deliver writes every pending result whose
+  // submission has completed. Await first submits and awaits the oldest count
+  // pending results (all of them for SIZE_MAX), then delivers.
+  void DeliverDeferredOcclusionResults();
+  void AwaitDeferredOcclusionResults(size_t count);
+  // Pending results up to and including the last one for this guest address
+  // or host index, or 0.
+  size_t DeferredOcclusionResultsThrough(uint32_t sample_count_address,
+                                         uint32_t host_index) const;
   uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
   void WriteGuestOcclusionResult(xenos::xe_gpu_depth_sample_counts* sample_counts,
                                  uint64_t samples);
@@ -829,6 +842,21 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t host_index = UINT32_MAX;
     bool valid = false;
   } active_occlusion_query_;
+  struct DeferredOcclusionResult {
+    uint32_t sample_count_address;
+    uint32_t host_index;
+    uint64_t submission;
+  };
+  // In host index order: indices are acquired cyclically and the cursor is
+  // only reset once this is empty.
+  std::deque<DeferredOcclusionResult> deferred_occlusion_results_;
+  // Timed waits in PrepareForWait; see there.
+  HANDLE deferred_occlusion_event_ = nullptr;
+  // Counting only (native_gpu_wait_stats.h): why the next EndSubmission runs,
+  // and whether the next fence wait is BeginSubmission's frame-latency wait.
+  enum class NativeSubmissionCause : uint8_t { kOther, kPrimaryBufferEnd, kOcclusionQuery };
+  NativeSubmissionCause native_submission_cause_ = NativeSubmissionCause::kOther;
+  bool native_frame_latency_await_ = false;
   struct VertexBufferState {
     uint32_t address = UINT32_MAX;
     uint32_t size = UINT32_MAX;
