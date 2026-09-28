@@ -91,6 +91,7 @@ REXCVAR_DECLARE(bool, nb_native_narrow_invalidation);
 REXCVAR_DECLARE(bool, nb_native_invalidation_diagnostics);
 REXCVAR_DECLARE(int32_t, anisotropic_override);
 REXCVAR_DECLARE(bool, nb_rt_ownership_fastpath);
+REXCVAR_DECLARE(bool, nb_emulated_sampler_memo);
 REXCVAR_DEFINE_BOOL(nb_native_minimal_command_diagnostics, true, "nb",
                     "Omit per-command shader/draw/copy and generic CPU clocks, so IssueDraw/generic and shader-load/copy "
                     "figures read 0; false restores them. Wall-frame and swap timing remain")
@@ -338,6 +339,7 @@ AssetBenchmarkPhase AssetPhaseForFrame(uint64_t frame) {
   // 17592186044416 re-reads blocked WAIT_REG_MEM predicates at yield cadence for up to 5 ms.
   // 35184372088832 draws alpha-test-free native pixel shaders when the alpha test cannot discard.
   // 70368744177664 skips render-target claims that the ownership map already satisfies.
+  // 140737488355328 skips emulated-draw sampler parameter loops that cannot have changed.
   if (offset / length >= (perf_start > 0 ? PerfBenchmarkOptions().size() : std::size(modes))) return phase;
   phase.window = int(offset / length);
   if (perf_start > 0) phase.options = PerfBenchmarkOptions()[phase.window];
@@ -392,6 +394,7 @@ int64_t CurrentPerfOptions() {
          (REXCVAR_GET(nb_native_wait_spin_us) > 0 ? 17592186044416LL : 0) |
          (REXCVAR_GET(nb_native_alpha_test_variant) ? 35184372088832LL : 0) |
          (REXCVAR_GET(nb_rt_ownership_fastpath) ? 70368744177664LL : 0) |
+         (REXCVAR_GET(nb_emulated_sampler_memo) ? 140737488355328LL : 0) |
          (REXCVAR_GET(nb_native_replay_chunk_draws) >= 2048 ? 2199023255552LL :
           REXCVAR_GET(nb_native_replay_chunk_draws) > 0 ? 1099511627776LL : 0)
 #if NB_HAS_RUNTIME_WATCH_CONTROL
@@ -442,6 +445,7 @@ void ApplyPerfOptions(int64_t options) {
   REXCVAR_SET(nb_native_wait_spin_us, (options & 17592186044416LL) ? 5000 : 0);
   REXCVAR_SET(nb_native_alpha_test_variant, (options & 35184372088832LL) != 0);
   REXCVAR_SET(nb_rt_ownership_fastpath, (options & 70368744177664LL) != 0);
+  REXCVAR_SET(nb_emulated_sampler_memo, (options & 140737488355328LL) != 0);
   REXCVAR_SET(nb_native_replay_chunk_draws, (options & 2199023255552LL) ? 2048 :
                                         (options & 1099511627776LL) ? 1024 : 0);
 #if NB_HAS_RUNTIME_WATCH_CONTROL

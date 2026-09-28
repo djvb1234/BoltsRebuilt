@@ -44,6 +44,7 @@
 #include "native/native_gpu_budget_probe.h"
 #include <exception>
 #include "native/native_replay_worker.h"
+#include "native/native_sampler_parameter_memo.h"
 
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -115,6 +116,28 @@ REXCVAR_DEFINE_BOOL(nb_native_hardware_indices, false, "nb",
 REXCVAR_DEFINE_BOOL(nb_native_submission_diagnostics, false, "nb",
                     "Measure host submission stages and count queued barriers; these diagnostics do not measure GPU execution time")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// nb: UpdateBindings skips a stage's GetSamplerParameters loop while the same shader is bound, no
+// texture fetch constant has been written and anisotropic_override is unchanged since the stage's
+// last evaluation, because every call would then return the value already stored
+// (native/native_sampler_parameter_memo.h). False evaluates every sampler of every draw.
+REXCVAR_DEFINE_BOOL(nb_emulated_sampler_memo, false, "nb",
+                    "Skip re-deriving emulated-draw sampler parameters that cannot have changed")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DECLARE(int32_t, anisotropic_override);
+
+namespace {
+// Bumped, whatever the switch, on every texture fetch constant write and when cached state is
+// reset (context setup and shutdown, cache clears). Command processor thread only.
+uint64_t g_nb_fetch_constant_generation = 1;
+constinit nb::gpu::NativeSamplerParameterMemo g_nb_sampler_memo_vertex;
+constinit nb::gpu::NativeSamplerParameterMemo g_nb_sampler_memo_pixel;
+void NbInvalidateSamplerMemos() {
+  ++g_nb_fetch_constant_generation;
+  g_nb_sampler_memo_vertex.Invalidate();
+  g_nb_sampler_memo_pixel.Invalidate();
+}
+}  // namespace
 
 // nb: Phase 3 item 6 named counter set. Path of a JSON-lines file receiving
 // one object per swap with the per-frame counters; empty = off.
@@ -305,6 +328,7 @@ void D3D12CommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
   InvalidateAllVertexBufferResidency();
   cache_clear_requested_ = true;
+  NbInvalidateSamplerMemos();
 }
 
 void D3D12CommandProcessor::InvalidateGpuMemory() {
@@ -1256,6 +1280,7 @@ void D3D12CommandProcessor::EndNativeBudgetScope(uint32_t previous) {
 }
 
 bool D3D12CommandProcessor::SetupContext() {
+  NbInvalidateSamplerMemos();
   if (!CommandProcessor::SetupContext()) {
     REXGPU_ERROR("Failed to initialize base command processor context");
     return false;
@@ -2069,6 +2094,7 @@ bool D3D12CommandProcessor::SetupContext() {
 }
 
 void D3D12CommandProcessor::ShutdownContext() {
+  NbInvalidateSamplerMemos();
   const bool native_timing_idle = AwaitAllQueueOperationsCompletion();
   if (native_replay_worker_ && !native_timing_idle) {
     TerminateUnprovenNativeReplay();
@@ -2257,6 +2283,7 @@ void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   } else if (index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
              index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
     cbuffer_binding_fetch_.up_to_date = false;
+    ++g_nb_fetch_constant_generation;
     if (texture_cache_ != nullptr) {
       texture_cache_->TextureFetchConstantWritten((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) /
                                                   6);
@@ -2335,6 +2362,7 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
       end_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
     memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
     cbuffer_binding_fetch_.up_to_date = false;
+    ++g_nb_fetch_constant_generation;
     uint32_t first_fetch_dword = start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
     uint32_t last_fetch_dword = end_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
     if (texture_cache_) {
@@ -4365,6 +4393,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
 
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
       cache_clear_requested_ = false;
+      NbInvalidateSamplerMemos();
 
       ClearCommandAllocatorCache();
 
@@ -5105,6 +5134,9 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_shared_memory_and_bindful_edram);
   }
 
+  const bool sampler_memo_enabled = REXCVAR_GET(nb_emulated_sampler_memo);
+  const int32_t sampler_anisotropic_override = REXCVAR_GET(anisotropic_override);
+
   // Get textures and samplers used by the vertex shader, check if the last used
   // samplers are compatible and update them.
   size_t texture_layout_uid_vertex = vertex_shader->GetTextureBindingLayoutUserUID();
@@ -5121,16 +5153,24 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
       bindful_samplers_written_vertex_ = false;
     }
-    current_samplers_vertex_.resize(
-        std::max(current_samplers_vertex_.size(), sampler_count_vertex));
-    for (size_t i = 0; i < sampler_count_vertex; ++i) {
-      D3D12TextureCache::SamplerParameters parameters =
-          texture_cache_->GetSamplerParameters(samplers_vertex[i]);
-      if (current_samplers_vertex_[i] != parameters) {
-        cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
-        bindful_samplers_written_vertex_ = false;
-        current_samplers_vertex_[i] = parameters;
+    // nb: a match means every GetSamplerParameters call below would return the stored value.
+    if (!(sampler_memo_enabled &&
+          g_nb_sampler_memo_vertex.Matches(this, vertex_shader, vertex_shader->ucode_data_hash(),
+                                           g_nb_fetch_constant_generation,
+                                           sampler_anisotropic_override))) {
+      current_samplers_vertex_.resize(
+          std::max(current_samplers_vertex_.size(), sampler_count_vertex));
+      for (size_t i = 0; i < sampler_count_vertex; ++i) {
+        D3D12TextureCache::SamplerParameters parameters =
+            texture_cache_->GetSamplerParameters(samplers_vertex[i]);
+        if (current_samplers_vertex_[i] != parameters) {
+          cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
+          bindful_samplers_written_vertex_ = false;
+          current_samplers_vertex_[i] = parameters;
+        }
       }
+      g_nb_sampler_memo_vertex.Publish(this, vertex_shader, vertex_shader->ucode_data_hash(),
+                                       g_nb_fetch_constant_generation, sampler_anisotropic_override);
     }
   }
 
@@ -5153,16 +5193,23 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
         cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
         bindful_samplers_written_pixel_ = false;
       }
-      current_samplers_pixel_.resize(
-          std::max(current_samplers_pixel_.size(), size_t(sampler_count_pixel)));
-      for (uint32_t i = 0; i < sampler_count_pixel; ++i) {
-        D3D12TextureCache::SamplerParameters parameters =
-            texture_cache_->GetSamplerParameters((*samplers_pixel)[i]);
-        if (current_samplers_pixel_[i] != parameters) {
-          current_samplers_pixel_[i] = parameters;
-          cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
-          bindful_samplers_written_pixel_ = false;
+      if (!(sampler_memo_enabled &&
+            g_nb_sampler_memo_pixel.Matches(this, pixel_shader, pixel_shader->ucode_data_hash(),
+                                            g_nb_fetch_constant_generation,
+                                            sampler_anisotropic_override))) {
+        current_samplers_pixel_.resize(
+            std::max(current_samplers_pixel_.size(), size_t(sampler_count_pixel)));
+        for (uint32_t i = 0; i < sampler_count_pixel; ++i) {
+          D3D12TextureCache::SamplerParameters parameters =
+              texture_cache_->GetSamplerParameters((*samplers_pixel)[i]);
+          if (current_samplers_pixel_[i] != parameters) {
+            current_samplers_pixel_[i] = parameters;
+            cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
+            bindful_samplers_written_pixel_ = false;
+          }
         }
+        g_nb_sampler_memo_pixel.Publish(this, pixel_shader, pixel_shader->ucode_data_hash(),
+                                        g_nb_fetch_constant_generation, sampler_anisotropic_override);
       }
     }
   } else {
