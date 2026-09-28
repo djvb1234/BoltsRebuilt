@@ -73,6 +73,7 @@ struct Model {
   std::array<bool, kPages> allocated{}, valid{}, gpu_authority{};
   std::array<uint32_t, kPages> cpu{}, gpu{};
   bool enabled = true;
+  bool promote_uploads = false;
   uint32_t depth = 0;
   uint64_t copies = 0;
   uint64_t hits = 0;
@@ -144,7 +145,15 @@ struct Model {
       gpu[page] = cpu[page];
       ++copies;
       if (int(page) == invalidate_after_copy) CpuWrite(page, cpu[page] + 1);
-      // Deliberately no publication after copy success.
+      // No publication at copy time; with promote_uploads, only afterwards.
+    }
+    if (eligible && promote_uploads) {
+      // The live validity vector, packed the way SharedMemory stores it.
+      std::array<uint64_t, kPages / 64> live{};
+      for (uint32_t page = 0; page < kPages; ++page) {
+        if (valid[page]) live[page / 64] |= uint64_t(1) << (page % 64);
+      }
+      mirror.PromoteLiveRanges(ranges, live.data(), live.size());
     }
     return true;
   }
@@ -197,7 +206,57 @@ void PublicationAndAuthority() {
   Check(!Has(p->mirror, one.first, one.second));
 }
 
-void ScopeAndFlatOracle() {
+void UploadPromotion() {
+  auto p = std::make_unique<Model>();
+  p->promote_uploads = true;
+  const Range one{3 * 4096 + 7, 9};
+  p->cpu[3] = 11;
+  Check(p->Request({&one, 1}));
+  Check(p->copies == 1 && Has(p->mirror, one.first, one.second));
+  Check(p->Request({&one, 1}));
+  Check(p->hits == 1 && p->copies == 1);
+  // A write that lands after the copy but before promotion must not be mirrored.
+  p->CpuWrite(3, 12);
+  Check(p->Request({&one, 1}, -1, 3));
+  Check(!p->valid[3] && !Has(p->mirror, one.first, one.second));
+  Check(p->Request({&one, 1}));
+  Check(p->gpu[3] == 13 && Has(p->mirror, one.first, one.second));
+  // Only the requested pages are promoted, even when neighbours are valid.
+  const Range wide{10 * 4096, 3 * 4096};
+  Check(p->Request({&wide, 1}));
+  const Range inner{11 * 4096, 4096};
+  p->mirror.Reset();
+  Check(p->Request({&inner, 1}));
+  Check(Has(p->mirror, inner.first, inner.second) && !Has(p->mirror, 10 * 4096, 1) &&
+        !Has(p->mirror, 12 * 4096, 1));
+  // A failed allocation promotes nothing; a nested request never promotes.
+  p->mirror.Reset();
+  const std::array<Range, 2> two{{{20 * 4096, 1}, {21 * 4096, 1}}};
+  Check(!p->Request(two, 21));
+  Check(!Has(p->mirror, 20 * 4096, 1));
+  p->CpuWrite(30, 5);
+  const Range probe{30 * 4096, 4096};
+  Check(p->Request({&probe, 1}, -1, -1, true));
+  Check(Has(p->mirror, probe.first, probe.second));
+  // Frame sweep and toggle still clear everything promoted this way.
+  p->Frame();
+  Check(!Has(p->mirror, probe.first, probe.second));
+  Check(p->Request({&probe, 1}));
+  p->Toggle(false);
+  Check(!Has(p->mirror, probe.first, probe.second));
+  // Out-of-range and empty spans promote nothing and never index past the vector.
+  Mirror m;
+  const uint64_t all = UINT64_MAX;
+  const std::array<Range, 3> bogus{{{0, 0}, {Mirror::kBufferBytes, 1}, {Mirror::kBufferBytes - 1, 2}}};
+  Check(m.PromoteLiveRanges(bogus, &all, 1) == 0);
+  const Range past{64 * 4096, 4096};
+  Check(m.PromoteLiveRanges({&past, 1}, &all, 1) == 0);
+  const Range span{63 * 4096, 2 * 4096};
+  Check(m.PromoteLiveRanges({&span, 1}, &all, 1) == 1);
+  Check(Has(m, 63 * 4096, 4096) && !Has(m, 64 * 4096, 1));
+}
+
+void ScopeAndFlatOracle(bool promote_uploads) {
   uint32_t depth = 0;
   try {
     Scope outer(&depth);
@@ -209,6 +268,7 @@ void ScopeAndFlatOracle() {
   Check(depth == 0);
   { Scope foreign(nullptr); Check(!foreign.outer()); }
   auto m = std::make_unique<Model>();
+  m->promote_uploads = promote_uploads;
   uint32_t rng = 0xA34C517D;
   for (uint32_t event = 0; event < 12000; ++event) {
     rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
@@ -266,7 +326,9 @@ void ConcurrentMonotonicClears() {
 int main() {
   LiteralBoundsAndMasks();
   PublicationAndAuthority();
-  ScopeAndFlatOracle();
+  UploadPromotion();
+  ScopeAndFlatOracle(false);
+  ScopeAndFlatOracle(true);
   ConcurrentMonotonicClears();
-  std::cout << "PASS " << checks << " checks in 4 groups (concurrent count varies)\n";
+  std::cout << "PASS " << checks << " checks in 5 groups (concurrent count varies)\n";
 }

@@ -19,6 +19,7 @@ struct NativeSharedResidencyStats {
   uint64_t hit_bytes = 0;
   uint64_t hit_pages = 0;
   uint64_t promoted_pages = 0;
+  uint64_t upload_promoted_pages = 0;
   uint64_t recursive_bypasses = 0;
   uint64_t unsupported_page_bypasses = 0;
   uint64_t unsupported_caller_bypasses = 0;
@@ -32,6 +33,8 @@ const NativeSharedResidencyStats& GetNativeSharedResidencyStats() noexcept;
 // A bit means that a PREEXISTING valid page was observed under the SDK's global
 // lock, after every requested backing allocation succeeded. It never means
 // merely that MakeRangeValid ran: that happens before the CPU upload copy.
+// With nb_native_shared_residency_promote_uploads, a bit may also mean a page
+// that was still valid under that lock after the request's upload returned.
 //
 // Contract:
 // * Only the owning CP thread promotes, during a nonrecursive RequestRanges.
@@ -83,6 +86,26 @@ class NativeSharedResidencyMirror {
     if (!bits) return 0;
     const uint64_t previous = words_[word].fetch_or(bits, std::memory_order_seq_cst);
     return uint32_t(std::popcount(bits & ~previous));
+  }
+
+  // Optional second promotion point, after an outer request's upload returned
+  // success. Must be called under the authoritative scan lock with the live
+  // validity vector (one word per 64 mirror pages). A page that a concurrent
+  // write invalidated during the copy is already clear in live_valid, so only
+  // pages the SDK itself would now accept without an upload are promoted.
+  uint32_t PromoteLiveRanges(std::span<const Range> ranges, const uint64_t* live_valid,
+                             size_t live_word_count) noexcept {
+    uint32_t promoted = 0;
+    for (const auto& range : ranges) {
+      if (!range.second || range.first >= kBufferBytes ||
+          range.second > kBufferBytes - range.first) continue;
+      const uint32_t first = range.first >> kPageLog2;
+      const uint32_t last = (range.first + range.second - 1) >> kPageLog2;
+      for (uint32_t word = first / 64; word <= last / 64 && word < live_word_count; ++word) {
+        promoted += PromoteValidWord(word, live_valid[word], PageMask(word, first, last));
+      }
+    }
+    return promoted;
   }
 
   void ClearWord(uint32_t word, uint64_t mask) noexcept {
