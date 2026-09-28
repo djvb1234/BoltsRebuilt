@@ -14,7 +14,10 @@ emulated. Basic 3D instructions use the runtime's bounded stacked-texture path; 
 follow the SDK's face-space conversion. Texture sidecars use dimensions 2 (2D), 3 (stacked), 4 (cube).
 
 Usage:
-  ucode2hlsl.py <dump_dir> -o <out_dir> [--only <shader_hash>] [--fxc <path>]
+  ucode2hlsl.py <dump_dir> -o <out_dir> [--only <shader_hash>] [--fxc <path>] [--census <csv>]
+
+The summary counts refusals by category per stage. --census writes one row per stage (stage, hash, status,
+category, reason) for tools/shader_coverage_report.py, which weights the refusals by the draws they cost.
 
 The optional fxc check compiles each generated stage. Use gen_native_shaders.ps1 for machine locking,
 staging, checking changed stages before installation, and retaining existing library files.
@@ -22,6 +25,7 @@ staging, checking changed stages before installation, and retaining existing lib
 
 import argparse
 import collections
+import csv
 import json
 import math
 import os
@@ -1178,12 +1182,38 @@ def compile_check(fxc, out_dir, stem, stage):
     return "fxc: " + (message[0][:160] if message else "unknown error")
 
 
+# Operand-specific detail (label numbers, registers, format names that repeat per shader) split one cause
+# over many histogram rows. Each rule keeps the part that says what would have to be implemented.
+REFUSAL_CATEGORIES = (
+    (re.compile(r"^backward jump to "), "backward jump"),
+    (re.compile(r"^jump to missing label "), "jump to missing label"),
+    (re.compile(r"^operand .*\baL\b"), "operand relative to aL"),
+    (re.compile(r"^operand "), "operand"),
+    (re.compile(r"^source swizzle "), "source swizzle"),
+    (re.compile(r"^dest "), "dest"),
+    (re.compile(r"^export as source "), "export as source"),
+    (re.compile(r"^condition "), "condition"),
+    (re.compile(r"^stream vf\d+ fetched with two strides$"), "stream fetched with two strides"),
+    (re.compile(r"^fxc: "), "fxc"),
+)
+
+
+def refusal_category(reason):
+    """The histogram key for a refusal message: the message without its per-shader detail."""
+    for pattern, category in REFUSAL_CATEGORIES:
+        if pattern.search(reason):
+            return category
+    return reason
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dump_dir", help="directory of the SDK's shader dump (shader_<hash>.ucode.vert/.frag)")
     ap.add_argument("-o", "--out", required=True)
     ap.add_argument("--fxc", default=None)
     ap.add_argument("--only", default=None, help="translate just this shader hash")
+    ap.add_argument("--census", default=None,
+                    help="write stage,hash,status,category,reason for every stage to this CSV")
     args = ap.parse_args()
 
     shaders = []
@@ -1197,23 +1227,48 @@ def main():
 
     ok = 0
     reasons = collections.Counter()
+    categories = collections.Counter()
+    rows = []
     for shader_hash, stage in shaders:
         try:
             result = translate_shader(args.dump_dir, args.out, shader_hash, stage, args.fxc)
         except NotSupported as e:
             reasons[f"unsupported: {e}"] += 1
+            categories[(stage, f"unsupported: {refusal_category(str(e))}")] += 1
+            rows.append((stage, shader_hash, "unsupported", refusal_category(str(e)), str(e)))
             print(f"{stage}_{shader_hash}: unsupported: {e}")
             continue
         except Exception as e:  # a translator bug, not a guest shader we cannot express
             reasons[f"translator error {type(e).__name__}"] += 1
+            categories[(stage, f"translator error {type(e).__name__}")] += 1
+            rows.append((stage, shader_hash, "translator_error", type(e).__name__, str(e)))
             print(f"{stage}_{shader_hash}: translator error: {e}")
             continue
         if result == "ok":
             ok += 1
+            rows.append((stage, shader_hash, "ok", "", ""))
         else:
             reasons[result[:90]] += 1
+            categories[(stage, refusal_category(result))] += 1
+            rows.append((stage, shader_hash, "compile_failed", refusal_category(result), result))
             print(f"{stage}_{shader_hash}: {result}")
 
+    if args.census:
+        with open(args.census, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f, lineterminator="\n")
+            writer.writerow(("stage", "hash", "status", "category", "reason"))
+            writer.writerows(rows)
+
+    # By category and stage: a vertex refusal costs every pair that uses the vertex shader, so the two
+    # stages are worth reading apart.
+    for stage in ("vs", "ps"):
+        total = sum(1 for _, s in shaders if s == stage)
+        staged = sorted(((n, c) for (s, c), n in categories.items() if s == stage), reverse=True)
+        print(f"\n{stage}: {total} stages, {total - sum(n for n, _ in staged)} ok")
+        for n, category in staged:
+            print(f"  {n:4} {category}")
+
+    # Last, so the tail gen_native_shaders.ps1 prints is unchanged.
     print(f"\n{len(shaders)} shaders: {ok} ok, {len(shaders) - ok} unusable")
     for reason, n in reasons.most_common(20):
         print(f"  {n:4} {reason}")
