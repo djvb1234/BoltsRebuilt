@@ -134,9 +134,11 @@ namespace {
 // so select changes under an active mask are the observable proxy. Calibrate
 // against the Phase 3 step-5 trace before trusting this count.
 void NbCountTilePassIfBinning(uint64_t bin_select, uint64_t bin_mask) {
-  if ((bin_select != 0xFFFFFFFFull || bin_mask != 0xFFFFFFFFull) && (bin_select & bin_mask) != 0) {
-    ++GetPhase3Counters().tile_pass_count;
+  Phase3Counters& counters = GetPhase3Counters();
+  if (Phase3Counters::IsBinningActive(bin_select, bin_mask)) {
+    ++counters.tile_pass_count;
   }
+  counters.NoteBinSelect(bin_select, bin_mask);
 }
 
 
@@ -821,7 +823,11 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   // We also skip predicated swaps, as they are never valid (probably?).
   if (packet & 1) {
     bool any_pass = (bin_select_ & bin_mask_) != 0;
-    if (!any_pass || opcode == PM4_XE_SWAP) {
+    bool skip = !any_pass || opcode == PM4_XE_SWAP;
+    // nb: Phase 3 step 5. Is the guest predicating its band passes at all?
+    GetPhase3Counters().NotePredicatedPacket(
+        opcode == PM4_DRAW_INDX || opcode == PM4_DRAW_INDX_2, skip);
+    if (skip) {
       reader->AdvanceRead(count * sizeof(uint32_t));
       return true;
     }
@@ -1303,6 +1309,7 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
   uint32_t mask = reader->ReadAndSwap<uint32_t>();
   uint32_t write_reg_addr = reader->ReadAndSwap<uint32_t>();
   uint32_t write_data = reader->ReadAndSwap<uint32_t>();
+  ++GetPhase3Counters().cond_write_count;
   uint32_t value;
   if (wait_info & 0x10) {
     // Memory.
@@ -1406,6 +1413,16 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
   WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
+  // nb: Phase 3 step 5. Count the queries, and name the first one in the log so
+  // a trace can follow what the guest does with the extent it gets back.
+  ++GetPhase3Counters().screen_extent_query_count;
+  static bool nb_logged_screen_extent = false;
+  if (!nb_logged_screen_extent) {
+    nb_logged_screen_extent = true;
+    REXGPU_INFO("nb: first screen extent query, initiator {:08X}, address {:08X}, bin select "
+                "{:016X}, bin mask {:016X}; answered full-screen",
+                initiator, address, bin_select_, bin_mask_);
+  }
 
   // Let us hope we can fake this.
   // This callback tells the driver the xy coordinates affected by a previous
@@ -1555,6 +1572,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
       // TODO(Triang3l || JoelLinn): Handle this properly in the render
       // backends.
 
+      GetPhase3Counters().NoteDraw(bin_select_, bin_mask_, vgt_draw_initiator.num_indices);
       bool major_mode_explicit =
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,

@@ -4154,6 +4154,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 static void NbDumpPhase3Counters(uint32_t frame) {
   const std::string& path = REXCVAR_GET(nb_phase3_counters_file);
   if (path.empty()) {
+    GetPhase3Counters().ResetFramePassState();
     return;
   }
   static std::FILE* file = nullptr;
