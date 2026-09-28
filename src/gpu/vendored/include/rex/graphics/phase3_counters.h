@@ -42,8 +42,9 @@ struct Phase3Counters {
   // differs from the non-tiling defaults. Step 5 measures its saving against
   // this.
   uint64_t tile_pass_count = 0;
-  // Draws executed in more than one tile pass. Wired by Phase 3 step 5; stays
-  // zero until then.
+  // Draws executed in a tile pass after the frame's first one (pass ordinal 2
+  // or more, see NoteBinSelect). These are the repeat submissions a band skip
+  // or single-band rendering would remove.
   uint64_t duplicated_draw_across_passes_count = 0;
   // Phase 3 step 6. Draws that reached the pipeline bind while the D3D12
   // pipeline was still being created at record time; before step 6 these
@@ -69,6 +70,79 @@ struct Phase3Counters {
   // is the residual step-6 stall.
   uint64_t swap_wait_time_us = 0;
 
+  // Phase 3 step 5 measurement: what the repeated tile bands cost and whether
+  // the guest's own predication could already skip them. Counted in
+  // CommandProcessor::ExecutePacketType3 and ExecutePacketType3Draw.
+  //
+  // Draws executed while the binning state differs from the non-tiling
+  // defaults, and the sum of their VGT_DRAW_INITIATOR index counts.
+  uint64_t tiled_draw_count = 0;
+  uint64_t tiled_draw_indices = 0;
+  // Index sum of the draws in duplicated_draw_across_passes_count. Weighs the
+  // repeats by vertex work, since a repeat pays vertex and setup cost, not
+  // pixel cost.
+  uint64_t repeat_pass_draw_indices = 0;
+  // Highest tile pass ordinal reached this frame (0 when the frame had none).
+  uint64_t tile_pass_ordinal_max = 0;
+  // Type-3 packets carrying the predicate bit, and how many of them the bin
+  // test skipped. Split out for the draw packets.
+  uint64_t predicated_packet_count = 0;
+  uint64_t predicated_packet_skip_count = 0;
+  uint64_t predicated_draw_count = 0;
+  uint64_t predicated_draw_skip_count = 0;
+  // PM4_EVENT_WRITE_EXT screen extent reports. The SDK answers every one with
+  // a full-screen extent, so a guest that predicates tiles on them sees every
+  // draw touch every band.
+  uint64_t screen_extent_query_count = 0;
+  // PM4_COND_WRITE packets, the CP-side compare-and-write a guest could use to
+  // turn extents into bin masks.
+  uint64_t cond_write_count = 0;
+
+  // Per-frame tile pass tracking, not a counter. A pass starts when a bin
+  // select write under active binning changes the selection; the frame's
+  // first such write is pass 1.
+  static constexpr uint64_t kNoBinSelect = ~uint64_t(0);
+  uint64_t pass_bin_select = kNoBinSelect;
+
+  static bool IsBinningActive(uint64_t bin_select, uint64_t bin_mask) {
+    return (bin_select != 0xFFFFFFFFull || bin_mask != 0xFFFFFFFFull) &&
+           (bin_select & bin_mask) != 0;
+  }
+  void NoteBinSelect(uint64_t bin_select, uint64_t bin_mask) {
+    if (!IsBinningActive(bin_select, bin_mask) || bin_select == pass_bin_select) {
+      return;
+    }
+    pass_bin_select = bin_select;
+    ++tile_pass_ordinal_max;
+  }
+  // A draw that is about to be issued (not skipped by predication).
+  void NoteDraw(uint64_t bin_select, uint64_t bin_mask, uint32_t index_count) {
+    if (!IsBinningActive(bin_select, bin_mask)) {
+      return;
+    }
+    ++tiled_draw_count;
+    tiled_draw_indices += index_count;
+    if (tile_pass_ordinal_max >= 2) {
+      ++duplicated_draw_across_passes_count;
+      repeat_pass_draw_indices += index_count;
+    }
+  }
+  void NotePredicatedPacket(bool is_draw, bool skipped) {
+    ++predicated_packet_count;
+    predicated_packet_skip_count += skipped;
+    if (is_draw) {
+      ++predicated_draw_count;
+      predicated_draw_skip_count += skipped;
+    }
+  }
+  // Called at every frame close when the counters are not being dumped, so
+  // the pass ordinal stays per frame while the other counters stay
+  // cumulative (NativeGpuBudgetProbe relies on that).
+  void ResetFramePassState() {
+    pass_bin_select = kNoBinSelect;
+    tile_pass_ordinal_max = 0;
+  }
+
   void Reset() { *this = Phase3Counters{}; }
 
   // One JSON object per line, stable key order matching digest item 6. All
@@ -84,12 +158,24 @@ struct Phase3Counters {
                  ",\"alias_hits\":%" PRIu64 ",\"alias_misses\":%" PRIu64
                  ",\"texture_reloads_from_resolved_ranges\":%" PRIu64
                  ",\"readback_resolve_uses\":%" PRIu64
-                 ",\"swap_wait_time_us\":%" PRIu64 "}\n",
+                 ",\"swap_wait_time_us\":%" PRIu64
+                 ",\"tiled_draws\":%" PRIu64 ",\"tiled_draw_indices\":%" PRIu64
+                 ",\"repeat_pass_draw_indices\":%" PRIu64
+                 ",\"tile_pass_ordinal_max\":%" PRIu64
+                 ",\"predicated_packets\":%" PRIu64
+                 ",\"predicated_packets_skipped\":%" PRIu64
+                 ",\"predicated_draws\":%" PRIu64
+                 ",\"predicated_draws_skipped\":%" PRIu64
+                 ",\"screen_extent_queries\":%" PRIu64
+                 ",\"cond_writes\":%" PRIu64 "}\n",
                  frame, transfer_count, transfer_tiles, resolve_dump_count, tile_pass_count,
                  duplicated_draw_across_passes_count, record_time_pipeline_skip_count,
                  execute_time_null_handle_count, alias_hit_count, alias_miss_count,
                  texture_reload_from_resolved_range_count, readback_resolve_use_count,
-                 swap_wait_time_us);
+                 swap_wait_time_us, tiled_draw_count, tiled_draw_indices,
+                 repeat_pass_draw_indices, tile_pass_ordinal_max, predicated_packet_count,
+                 predicated_packet_skip_count, predicated_draw_count,
+                 predicated_draw_skip_count, screen_extent_query_count, cond_write_count);
   }
 };
 
