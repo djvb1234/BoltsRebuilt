@@ -317,6 +317,17 @@ class DeferredCommandList {
     arg = stencil_ref;
   }
 
+  // nb: stencil-bit transfer predication (render_target_cache.cpp, nb_transfer_stencil_bit_predication). A
+  // null buffer turns predication off.
+  void D3DSetPredication(ID3D12Resource* buffer, UINT64 aligned_buffer_offset,
+                         D3D12_PREDICATION_OP operation) {
+    auto& args = *reinterpret_cast<D3DSetPredicationArguments*>(
+        WriteCommand(Command::kD3DSetPredication, sizeof(D3DSetPredicationArguments)));
+    args.buffer = buffer;
+    args.aligned_buffer_offset = aligned_buffer_offset;
+    args.operation = operation;
+  }
+
   void D3DResourceBarrier(UINT num_barriers, const D3D12_RESOURCE_BARRIER* barriers) {
     if (num_barriers == 0) {
       return;
@@ -563,6 +574,8 @@ class DeferredCommandList {
     kEndDebugMarker,
     kInsertDebugMarker,
     kD3DSetNativeGraphicsConstantBufferViews,
+    // nb: last, so the command range checks name it as the end.
+    kD3DSetPredication,
   };
 
   struct CommandHeader {
@@ -650,6 +663,12 @@ class DeferredCommandList {
     ID3D12QueryHeap* query_heap;
     D3D12_QUERY_TYPE type;
     UINT index;
+  };
+
+  struct D3DSetPredicationArguments {
+    ID3D12Resource* buffer;
+    UINT64 aligned_buffer_offset;
+    D3D12_PREDICATION_OP operation;
   };
 
   struct D3DResolveQueryDataArguments {
